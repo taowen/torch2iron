@@ -38,7 +38,35 @@ class LlamaNpuRunner:
     def forward_pass(self, config, state):
         if config is not self.config:
             raise ValueError("LlamaNpuRunner was called with a different config")
-        return llama_forward_pass(self, config, state)
+        _, seq_len = state.token_ids.shape
+        if seq_len > 1:
+            ret = self.prefill(state)
+            state.num_preceding_tokens = state.token_ids.shape[1]
+            self.sync_prefill_cache_to_decode(state)
+            return ret
+
+        ret = self.decode(state)
+        state.num_preceding_tokens += 1
+        return ret
+
+    def prefill(self, state):
+        return _prefill_forward_pass(self, self.config, state)
+
+    def decode(self, state):
+        return _decode_forward_pass(self, self.config, state)
+
+    def sync_prefill_cache_to_decode(self, state):
+        # Pack prefill KV state into the fused decode packet cache.
+        for layer_idx in range(self.config.n_layers):
+            initialize_decode_packet_cache(
+                self.config,
+                self.aie_ops,
+                self.max_seq_len,
+                layer_idx,
+                self.aie_buffers.keys_cache[layer_idx].to_torch(),
+                self.aie_buffers.values_cache[layer_idx].to_torch(),
+                state.num_preceding_tokens,
+            )
 
 
 # Prefill
@@ -287,7 +315,7 @@ def transformer_block_forward_prefill(
     return attn_keys, attn_values
 
 
-def llama_forward_pass_prefill(runner, config, state):
+def _prefill_forward_pass(runner, config, state):
     aie_ops = runner.aie_ops
     aie_buffers = runner.aie_buffers
 
@@ -361,7 +389,7 @@ def llama_forward_pass_prefill(runner, config, state):
 # Decode
 # ##########################################################################
 
-def llama_forward_pass_decode(runner, config, state):
+def _decode_forward_pass(runner, config, state):
     aie_ops = runner.aie_ops
     max_seq_len = runner.max_seq_len
 
@@ -393,37 +421,6 @@ def llama_forward_pass_decode(runner, config, state):
     )
 
     return logits, state
-
-
-# Main
-# ##########################################################################
-
-
-def llama_forward_pass(runner, config, state):
-    aie_ops = runner.aie_ops
-    aie_buffers = runner.aie_buffers
-    max_seq_len = runner.max_seq_len
-
-    batch, seq_len = state.token_ids.shape
-    if seq_len > 1:
-        ret = llama_forward_pass_prefill(runner, config, state)
-        state.num_preceding_tokens = state.token_ids.shape[1]
-        # Pack prefill KV state into the fused decode packet cache.
-        for layer_idx in range(config.n_layers):
-            initialize_decode_packet_cache(
-                config,
-                aie_ops,
-                max_seq_len,
-                layer_idx,
-                aie_buffers.keys_cache[layer_idx].to_torch(),
-                aie_buffers.values_cache[layer_idx].to_torch(),
-                state.num_preceding_tokens,
-            )
-        return ret
-    else:
-        ret = llama_forward_pass_decode(runner, config, state)
-        state.num_preceding_tokens += 1
-        return ret
 
 
 def main():
