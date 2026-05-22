@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generated prefill runtime for exported_llama3.
+
+Regenerate with:
+    uv run python -m models.exported_llama3.codegen
+
+The transformer layer skeleton is rendered directly from
+torch.export.ExportedProgram. Low-level staging helpers remain explicit because
+they encode the current IRON buffer layout.
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+EXPECTED_PREFILL_LAYERS = {{ layer_indices(exported_program) | length }}
+
+
+def _grouped_query_attention_forward(
+    runner,
+    config,
+    x,
+    keys_cache,
+    values_cache,
+    layer_idx,
+    mask=None,
+):
+    aie_ops = runner.aie_ops
+    aie_buffers = runner.aie_buffers
+    batch, seq_len, _ = x.shape
+
+    # Step 1: Linear projections
+    aie_ops.prefill.attn_query(
+        aie_buffers.prefill.x_norm,
+        aie_buffers.W_attn_query_prefill[layer_idx],
+        aie_buffers.prefill.queries,
+    )
+    aie_ops.prefill.attn_key(
+        aie_buffers.prefill.x_norm,
+        aie_buffers.W_attn_key_prefill[layer_idx],
+        aie_buffers.prefill.keys,
+    )
+    aie_ops.prefill.attn_value(
+        aie_buffers.prefill.x_norm,
+        aie_buffers.W_attn_value_prefill[layer_idx],
+        aie_buffers.prefill.values,
+    )
+
+    # Step 2: Apply RoPE to queries and keys
+    aie_ops.prefill.rope_queries(
+        aie_buffers.prefill.queries,
+        aie_buffers.prefill.rope_angles,
+        aie_buffers.prefill.queries,
+    )
+    aie_ops.prefill.rope_keys(
+        aie_buffers.prefill.keys,
+        aie_buffers.prefill.rope_angles,
+        aie_buffers.prefill.keys,
+    )
+
+    # Read results from NPU; to_torch() syncs from device internally
+    queries = aie_buffers.prefill.queries.to_torch()[: seq_len * config.n_heads, :]
+    keys = aie_buffers.prefill.keys.to_torch()[: seq_len * config.n_kv_groups, :]
+    values = aie_buffers.prefill.values.to_torch()[
+        :seq_len, :
+    ]  # (seq_len, n_kv_groups * head_dim)
+    queries = queries.view(batch, seq_len, config.n_heads, config.head_dim)
+    keys = keys.unsqueeze(0).view(batch, seq_len, config.n_kv_groups, config.head_dim)
+    values = values.unsqueeze(0).view(
+        batch, seq_len, config.n_kv_groups, config.head_dim
+    )  # (batch, seq_len, num_kv_groups, head_dim)
+
+    # Step 3: Transpose for attention computation
+    # As a result of the attention projections, the queries, keys and values
+    # for each head are interspersed with each other. Transpose so that heads
+    # are consecutive for attention computation.
+    queries = queries.transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+    keys = keys.transpose(1, 2)  # (batch, num_kv_groups, seq_len, head_dim)
+    values = values.transpose(1, 2)  # (batch, num_kv_groups, seq_len, head_dim)
+
+    # Step 4: Append newly computed keys/values to the cache.
+    keys_cache = torch.cat([keys_cache, keys], dim=2)
+    values_cache = torch.cat([values_cache, values], dim=2)
+    keys = keys_cache
+    values = values_cache
+
+    # Step 5: Repeat values for grouped attention.
+    group_size = config.n_heads // config.n_kv_groups
+    values = values.repeat_interleave(group_size, dim=1)
+    context_len = keys.shape[2]
+
+    # Step 6: Compute attention scores using NPU per head.
+    queries_buf = aie_buffers.prefill.attn_scores_queries_all.torch_view().view(
+        config.n_heads, -1, config.head_dim
+    )
+    queries_buf[:, :seq_len, :] = queries.squeeze(0)[:, :seq_len, :]
+    keys_buf = aie_buffers.prefill.attn_scores_keys_all.torch_view().view(
+        config.n_kv_groups, config.head_dim, -1
+    )
+    keys_buf[:, :, :context_len] = keys.squeeze(0).transpose(-2, -1)
+
+    aie_buffers.prefill.attn_scores_queries_all.to("npu")
+    aie_buffers.prefill.attn_scores_keys_all.to("npu")
+    aie_buffers.prefill.attn_scores.to("npu")
+
+    for h in range(config.n_heads):
+        kv_group = h // group_size
+        aie_ops.prefill.attn_scores(
+            aie_buffers.prefill.attn_scores_queries_per_head[h],
+            aie_buffers.prefill.attn_scores_keys_per_kv_group[kv_group],
+            aie_buffers.prefill.attn_scores_per_head[h],
+        )
+
+    aie_ops.prefill.attn_scale(
+        aie_buffers.prefill.attn_scores,
+        aie_buffers.prefill.attn_scale_factor,
+        aie_buffers.prefill.attn_scores,
+    )
+    max_seq_len_buf = aie_buffers.prefill.attn_scores.shape[0] // config.n_heads
+    scores = (
+        # to_torch() syncs device->host; torch_view() would not sync here.
+        aie_buffers.prefill.attn_scores.to_torch()
+        .view(config.n_heads, max_seq_len_buf, max_seq_len_buf)
+        .unsqueeze(0)[:, :, :seq_len, :context_len]
+    )
+
+    if mask is not None:
+        scores = scores.masked_fill(mask, float("-inf"))
+
+    scores = torch.softmax(scores.to(torch.float32), dim=-1).to(torch.bfloat16)
+    context = torch.matmul(scores, values)
+    context = context.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+
+    output = torch.nn.functional.linear(
+        context, config.weights[f"model.layers.{layer_idx}.self_attn.o_proj.weight"]
+    )
+
+    return output, keys_cache, values_cache
+
+
+def _swiglu_ffn_forward(runner, layer_idx):
+    aie_ops = runner.aie_ops
+    aie_buffers = runner.aie_buffers
+
+    aie_ops.prefill.ffn_up_gate(
+        aie_buffers.prefill.x_norm,
+        aie_buffers.W_ffn_gate_prefill[layer_idx],
+        aie_buffers.prefill.ffn_gate,
+    )
+    aie_ops.prefill.ffn_up_gate(
+        aie_buffers.prefill.x_norm,
+        aie_buffers.W_ffn_up_prefill[layer_idx],
+        aie_buffers.prefill.ffn_up,
+    )
+    aie_ops.prefill.ffn_silu(aie_buffers.prefill.ffn_gate, aie_buffers.prefill.ffn_gate)
+    aie_ops.prefill.eltwise_mul_ffn(
+        aie_buffers.prefill.ffn_gate,
+        aie_buffers.prefill.ffn_up,
+        aie_buffers.prefill.ffn_hidden,
+    )
+    aie_ops.prefill.ffn_down(
+        aie_buffers.prefill.ffn_hidden,
+        aie_buffers.W_ffn_down_prefill[layer_idx],
+        aie_buffers.prefill.ffn_output,
+    )
+
+
+def _transformer_block_forward(
+    runner,
+    config,
+    seq_len,
+    layer_idx,
+    attn_keys_cache,
+    attn_values_cache,
+    attn_mask,
+):
+    aie_ops = runner.aie_ops
+    aie_buffers = runner.aie_buffers
+
+{% for node in representative_layer_nodes(exported_program) %}
+{% if target_is(node, "aten.rms_norm.default") and path_endswith(node, "input_layernorm") %}
+    aie_ops.prefill.rms_norm(
+        aie_buffers.prefill.x,
+        aie_buffers.W_norm1[layer_idx],
+        aie_buffers.prefill.x_norm,
+    )
+    x_norm = aie_buffers.prefill.x_norm.to_torch().unsqueeze(0)[:, :seq_len, :]
+
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.q_proj") %}
+    attn_output, attn_keys, attn_values = _grouped_query_attention_forward(
+        runner,
+        config,
+        x_norm,
+        attn_keys_cache,
+        attn_values_cache,
+        layer_idx,
+        attn_mask,
+    )
+
+{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "self_attn.o_proj") %}
+    aie_buffers.prefill.attn_output.torch_view().unsqueeze(0)[
+        0, :seq_len, :
+    ] = attn_output
+    aie_buffers.prefill.attn_output.to("npu")
+    aie_ops.prefill.residual_add(
+        aie_buffers.prefill.x, aie_buffers.prefill.attn_output, aie_buffers.prefill.x
+    )
+    x = aie_buffers.prefill.x.to_torch().unsqueeze(0)[:, :seq_len, :]
+
+{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "post_attention_layernorm") %}
+    aie_buffers.prefill.x.torch_view().unsqueeze(0)[0, :seq_len, :] = x
+    aie_buffers.prefill.x.to("npu")
+    aie_ops.prefill.rms_norm(
+        aie_buffers.prefill.x,
+        aie_buffers.W_norm2[layer_idx],
+        aie_buffers.prefill.x_norm,
+    )
+    x_norm = aie_buffers.prefill.x_norm.to_torch().unsqueeze(0)[:, :seq_len, :]
+
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.gate_proj") %}
+    _swiglu_ffn_forward(runner, layer_idx)
+
+{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "mlp.down_proj") %}
+    aie_ops.prefill.residual_add(
+        aie_buffers.prefill.x, aie_buffers.prefill.ffn_output, aie_buffers.prefill.x
+    )
+
+{% endif %}
+{% endfor %}
+    return attn_keys, attn_values
+
+
+def prefill_forward_pass(runner, state):
+    config = runner.config
+    if config.n_layers != EXPECTED_PREFILL_LAYERS:
+        raise ValueError(
+            f"generated prefill graph expects {EXPECTED_PREFILL_LAYERS} layers, "
+            f"got {config.n_layers}"
+        )
+
+    aie_ops = runner.aie_ops
+    aie_buffers = runner.aie_buffers
+
+    _, seq_len = state.token_ids.shape
+
+    num_preceding_tokens = state.attn_keys_caches[0].shape[2]
+    angles_slice = config.angles[num_preceding_tokens : num_preceding_tokens + seq_len]
+    aie_buffers.prefill.rope_angles.torch_view()[:seq_len, :] = angles_slice
+    aie_buffers.prefill.rope_angles.to("npu")
+
+    tok_emb_weight = config.weights["model.embed_tokens.weight"]
+    x = torch.nn.functional.embedding(state.token_ids, tok_emb_weight)
+    attn_mask = torch.triu(
+        torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
+    )
+    aie_buffers.prefill.x.torch_view().unsqueeze(0)[0, :seq_len, :] = x
+    aie_buffers.prefill.x.to("npu")
+
+    for layer_idx in range(config.n_layers):
+        (
+            state.attn_keys_caches[layer_idx],
+            state.attn_values_caches[layer_idx],
+        ) = _transformer_block_forward(
+            runner,
+            config,
+            seq_len,
+            layer_idx,
+            state.attn_keys_caches[layer_idx],
+            state.attn_values_caches[layer_idx],
+            attn_mask=attn_mask,
+        )
+
+    aie_ops.prefill.rms_norm(
+        aie_buffers.prefill.x, aie_buffers.W_final_norm, aie_buffers.prefill.x
+    )
+
+    for i in range(config.vocab_partitions):
+        aie_ops.prefill.out_head(
+            aie_buffers.prefill.x,
+            aie_buffers.W_out_head_parts[i],
+            aie_buffers.prefill.logits_parts[i],
+        )
+    logits_padded_partitioned = aie_buffers.prefill.logits.to_torch()
+    logits_padded = (
+        logits_padded_partitioned.transpose(0, 1)
+        .contiguous()
+        .view(-1, config.padded_vocab_size)
+    )
+    logits = logits_padded.unsqueeze(0)[:, :seq_len, : config.vocab_size]
+
+    for layer_idx in range(config.n_layers):
+        cache_len = state.attn_keys_caches[layer_idx].shape[2]
+        aie_buffers.keys_cache[layer_idx].torch_view()[:, :cache_len, :] = (
+            state.attn_keys_caches[layer_idx].squeeze(0)
+        )
+        aie_buffers.values_cache[layer_idx].torch_view()[:, :cache_len, :] = (
+            state.attn_values_caches[layer_idx].squeeze(0)
+        )
+        aie_buffers.keys_cache[layer_idx].to("npu")
+        aie_buffers.values_cache[layer_idx].to("npu")
+
+    return logits, state

@@ -63,6 +63,18 @@ def layer_indices(exported_program) -> list[int]:
     )
 
 
+def representative_layer_nodes(exported_program) -> list[object]:
+    layers = layer_indices(exported_program)
+    if not layers:
+        raise RuntimeError("exported graph has no transformer layer nodes")
+    representative_layer = layers[0]
+    return [
+        node
+        for node in call_function_nodes(exported_program)
+        if layer_idx(node) == representative_layer
+    ]
+
+
 def target_is(node, target: str) -> bool:
     return str(node.target) == target
 
@@ -218,6 +230,21 @@ def export_decode_program_for_codegen() -> object:
     return export_program(config, "decode")
 
 
+def export_prefill_program_for_codegen() -> object:
+    config = LlamaExportConfig(
+        vocab_size=128,
+        emb_dim=32,
+        n_layers=16,
+        n_heads=4,
+        n_kv_groups=2,
+        head_dim=8,
+        hidden_dim=64,
+        max_seq_len=8,
+        chunk_size=DECODE_ATTN_CHUNK_SIZE,
+    )
+    return export_program(config, "prefill")
+
+
 def _jinja_env() -> Environment:
     template_dir = Path(__file__).with_name("templates")
     env = Environment(
@@ -231,6 +258,7 @@ def _jinja_env() -> Environment:
         path_endswith=path_endswith,
         layer_idx=layer_idx,
         layer_indices=layer_indices,
+        representative_layer_nodes=representative_layer_nodes,
         target_is=target_is,
         tensor_rank=tensor_rank,
         arg_path_endswith=arg_path_endswith,
@@ -256,10 +284,19 @@ def render_decode_fused(exported_program) -> str:
     )
 
 
-def render_generated_files(exported_program) -> dict[str, str]:
+def render_prefill_runtime(exported_program) -> str:
+    return _jinja_env().get_template("prefill_runtime.py.j2").render(
+        exported_program=exported_program
+    )
+
+
+def render_generated_files() -> dict[str, str]:
+    decode_program = export_decode_program_for_codegen()
+    prefill_program = export_prefill_program_for_codegen()
     return {
-        "decode_layout.py": render_decode_layout(exported_program),
-        "decode_fused.py": render_decode_fused(exported_program),
+        "decode_layout.py": render_decode_layout(decode_program),
+        "decode_fused.py": render_decode_fused(decode_program),
+        "prefill_runtime.py": render_prefill_runtime(prefill_program),
     }
 
 
@@ -282,7 +319,7 @@ def _parse_args(argv: list[str] | None = None):
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    rendered_files = render_generated_files(export_decode_program_for_codegen())
+    rendered_files = render_generated_files()
     if args.check:
         for name, rendered in rendered_files.items():
             output = args.output_dir / name
