@@ -166,6 +166,43 @@ def decode_lm_head_weight_names(exported_program) -> list[str]:
     return names
 
 
+def _parameter_targets(exported_program) -> dict[str, str]:
+    return {
+        spec.arg.name: spec.target
+        for spec in exported_program.graph_signature.input_specs
+        if spec.target is not None
+    }
+
+
+def decode_weight_source(exported_program, node) -> str | None:
+    if target_is(node, "aten.linear.default"):
+        parameter_node = node.args[1]
+    elif target_is(node, "aten.rms_norm.default"):
+        parameter_node = node.args[2]
+    else:
+        return None
+
+    return _parameter_targets(exported_program)[parameter_node.name]
+
+
+def decode_weight_specs(exported_program) -> list[dict[str, object]]:
+    specs = []
+    for node in call_function_nodes(exported_program):
+        name = decode_buffer_name(node)
+        if name is None:
+            continue
+        group = "lm_head" if name == "W_out_head" else "weight"
+        specs.append(
+            {
+                "layer": layer_idx(node),
+                "group": group,
+                "name": name,
+                "source": decode_weight_source(exported_program, node),
+            }
+        )
+    return specs
+
+
 def export_decode_program_for_codegen() -> object:
     config = LlamaExportConfig(
         vocab_size=128,
@@ -181,7 +218,7 @@ def export_decode_program_for_codegen() -> object:
     return export_program(config, "decode")
 
 
-def render_decode_fused(exported_program) -> str:
+def _jinja_env() -> Environment:
     template_dir = Path(__file__).with_name("templates")
     env = Environment(
         loader=FileSystemLoader(template_dir),
@@ -201,10 +238,29 @@ def render_decode_fused(exported_program) -> str:
         decode_chunk_size=decode_chunk_size,
         decode_transformer_weight_names=decode_transformer_weight_names,
         decode_lm_head_weight_names=decode_lm_head_weight_names,
+        decode_weight_specs=decode_weight_specs,
     )
+    return env
+
+
+def render_decode_layout(exported_program) -> str:
+    return _jinja_env().get_template("decode_layout.py.j2").render(
+        exported_program=exported_program
+    )
+
+
+def render_decode_fused(exported_program) -> str:
+    env = _jinja_env()
     return env.get_template("decode_fused.py.j2").render(
         exported_program=exported_program
     )
+
+
+def render_generated_files(exported_program) -> dict[str, str]:
+    return {
+        "decode_layout.py": render_decode_layout(exported_program),
+        "decode_fused.py": render_decode_fused(exported_program),
+    }
 
 
 def _parse_args(argv: list[str] | None = None):
@@ -212,9 +268,9 @@ def _parse_args(argv: list[str] | None = None):
         description="Generate exported_llama3 runtime code from torch.export graphs"
     )
     parser.add_argument(
-        "--output",
+        "--output-dir",
         type=Path,
-        default=Path(__file__).with_name("generated") / "decode_fused.py",
+        default=Path(__file__).with_name("generated"),
     )
     parser.add_argument(
         "--check",
@@ -226,15 +282,18 @@ def _parse_args(argv: list[str] | None = None):
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    rendered = render_decode_fused(export_decode_program_for_codegen())
+    rendered_files = render_generated_files(export_decode_program_for_codegen())
     if args.check:
-        current = args.output.read_text() if args.output.exists() else None
-        if current != rendered:
-            raise SystemExit(f"{args.output} is not up to date")
+        for name, rendered in rendered_files.items():
+            output = args.output_dir / name
+            current = output.read_text() if output.exists() else None
+            if current != rendered:
+                raise SystemExit(f"{output} is not up to date")
         return 0
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(rendered)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    for name, rendered in rendered_files.items():
+        (args.output_dir / name).write_text(rendered)
     return 0
 
 

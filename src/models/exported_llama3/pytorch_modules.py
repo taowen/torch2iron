@@ -325,7 +325,11 @@ class ExportLlamaPrefillModel(nn.Module):
             present_values.append(present_value)
 
         logits = self.lm_head(self.norm(x))
-        return (logits, *present_keys, *present_values)
+        return {
+            "logits": logits,
+            "present_keys": tuple(present_keys),
+            "present_values": tuple(present_values),
+        }
 
 
 class ExportLlamaDecodeModel(nn.Module):
@@ -351,7 +355,11 @@ class ExportLlamaDecodeModel(nn.Module):
             present_values.append(present_value)
 
         logits = self.lm_head(self.norm(x))
-        return (logits, *present_keys, *present_values)
+        return {
+            "logits": logits,
+            "present_keys": tuple(present_keys),
+            "present_values": tuple(present_values),
+        }
 
 
 def example_prefill_args(config: LlamaExportConfig) -> tuple[Tensor, ...]:

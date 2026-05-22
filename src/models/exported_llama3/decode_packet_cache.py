@@ -5,6 +5,11 @@
 
 from aie.utils.hostruntime.xrtruntime.tensor import xrt as pyxrt
 
+from models.exported_llama3.generated.decode_layout import (
+    DECODE_PACKET_CACHE_NAMES,
+    DECODE_PRESENT_KEY_NAMES,
+    DECODE_PRESENT_VALUE_NAMES,
+)
 from models.exported_llama3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
@@ -62,7 +67,7 @@ def initialize_decode_packet_cache(
     values_cache,
     num_preceding_tokens,
 ):
-    packet_cache = aie_ops.decode.fused.get_buffer(f"packet_cache_{layer_idx}")
+    packet_cache = aie_ops.decode.fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
     packet = packet_cache.torch_view()
     packet.fill_(0)
 
@@ -133,16 +138,18 @@ def append_decode_kv_cache(config, aie_ops, max_seq_len, num_preceding_tokens):
 
     for layer_idx in range(config.n_layers):
         present_key = (
-            aie_ops.decode.fused.get_buffer(f"present_keys_{layer_idx}")
+            aie_ops.decode.fused.get_buffer(DECODE_PRESENT_KEY_NAMES[layer_idx])
             .data
             .reshape(config.n_kv_groups, config.head_dim)
         )
         present_value = (
-            aie_ops.decode.fused.get_buffer(f"present_values_{layer_idx}")
+            aie_ops.decode.fused.get_buffer(DECODE_PRESENT_VALUE_NAMES[layer_idx])
             .data
             .reshape(config.n_kv_groups, config.head_dim)
         )
-        packet_cache = aie_ops.decode.fused.get_buffer(f"packet_cache_{layer_idx}")
+        packet_cache = aie_ops.decode.fused.get_buffer(
+            DECODE_PACKET_CACHE_NAMES[layer_idx]
+        )
         sync_decode_packet_cache_slot(
             config,
             max_seq_len,

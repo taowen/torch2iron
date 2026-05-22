@@ -18,11 +18,11 @@ from torch2iron.operators import (
 )
 
 from models.exported_llama3.generated.decode_fused import build_decode_fused_op
-from models.exported_llama3.llama_weight_layout import (
-    iter_llama_decode_weight_specs,
+from models.exported_llama3.llama_packed_weights import (
     load_llama_packed_segment,
     validate_llama_packed_weight_artifact,
 )
+from models.exported_llama3.llama_weight_layout import iter_llama_decode_weight_specs
 
 
 class AIEPrefillOperations:

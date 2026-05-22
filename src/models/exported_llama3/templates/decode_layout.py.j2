@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generated decode layout constants for exported_llama3.
+
+Regenerate with:
+    uv run python -m models.exported_llama3.codegen
+
+This file is rendered directly from torch.export.ExportedProgram and intentionally
+does not import IRON runtime modules.
+"""
+
+from __future__ import annotations
+
+
+EXPECTED_DECODE_LAYERS = {{ layer_indices(exported_program) | length }}
+EXPORTED_DECODE_CHUNK_SIZE = {{ decode_chunk_size(exported_program) }}
+EXPORTED_DECODE_MAX_SEQ_LEN = {{ decode_max_seq_len(exported_program) }}
+
+DECODE_LAYER_INDICES = (
+{% for layer in layer_indices(exported_program) %}
+    {{ layer }},
+{% endfor %}
+)
+
+DECODE_PACKET_CACHE_NAMES = (
+{% for layer in layer_indices(exported_program) %}
+    "packet_cache_{{ layer }}",
+{% endfor %}
+)
+
+DECODE_PRESENT_KEY_NAMES = (
+{% for layer in layer_indices(exported_program) %}
+    "present_keys_{{ layer }}",
+{% endfor %}
+)
+
+DECODE_PRESENT_VALUE_NAMES = (
+{% for layer in layer_indices(exported_program) %}
+    "present_values_{{ layer }}",
+{% endfor %}
+)
+
+DECODE_OUTPUT_ARGS = (
+    "logits",
+    *DECODE_PRESENT_KEY_NAMES,
+    *DECODE_PRESENT_VALUE_NAMES,
+)
+
+DECODE_WEIGHT_SPECS = (
+{% for spec in decode_weight_specs(exported_program) %}
+{% set export_source = spec["source"] %}
+    {
+        "layer": {{ spec["layer"] if spec["layer"] is not none else "None" }},
+        "group": "{{ spec["group"] }}",
+        "name": "{{ spec["name"] }}",
+{% if export_source == "lm_head.weight" %}
+        "source": "model.embed_tokens.weight",
+{% elif export_source == "norm.weight" or export_source.startswith("layers.") %}
+        "source": "model.{{ export_source }}",
+{% else %}
+        "source": "{{ export_source }}",
+{% endif %}
+    },
+{% endfor %}
+)
+
+DECODE_TRANSFORMER_WEIGHT_NAMES = (
+{% for spec in decode_weight_specs(exported_program) if spec["group"] == "weight" %}
+    "{{ spec["name"] }}",
+{% endfor %}
+)
+
+DECODE_LM_HEAD_WEIGHT_NAMES = (
+{% for spec in decode_weight_specs(exported_program) if spec["group"] == "lm_head" %}
+    "{{ spec["name"] }}",
+{% endfor %}
+)

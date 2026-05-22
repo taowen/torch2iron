@@ -20,7 +20,7 @@ from models.exported_llama3.decode_packet_cache import (
     append_decode_kv_cache,
     initialize_decode_packet_cache,
 )
-from models.exported_llama3.llama_weight_layout import (
+from models.exported_llama3.llama_packed_weights import (
     default_llama_packed_weights_dir,
     write_llama_packed_weight_artifact,
 )
