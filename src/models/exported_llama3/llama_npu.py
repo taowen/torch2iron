@@ -16,8 +16,8 @@ import math
 from pathlib import Path
 import sys
 import ml_dtypes
-from models.llama_3_2_1b import llama_inference_harness as harness
-from models.llama_3_2_1b.llama_weight_layout import (
+from models.exported_llama3 import llama_inference_harness as harness
+from models.exported_llama3.llama_weight_layout import (
     default_llama_packed_weights_dir,
     iter_llama_decode_weight_specs,
     llama_decode_lm_head_weight_names,

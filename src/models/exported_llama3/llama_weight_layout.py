@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 
-PACKED_WEIGHTS_FORMAT = "llama_3_2_1b_iron_packed_weights_v1"
+PACKED_WEIGHTS_FORMAT = "exported_llama3_iron_packed_weights_v1"
+LEGACY_PACKED_WEIGHTS_FORMATS = ("llama_3_2_1b_iron_packed_weights_v1",)
 PACKED_WEIGHTS_BIN = "weights.bf16.bin"
 PACKED_WEIGHTS_MANIFEST = "manifest.json"
 
@@ -240,10 +241,11 @@ def validate_llama_packed_weight_artifact(
 ) -> dict[str, object]:
     packed_dir = Path(packed_dir)
     manifest = load_llama_packed_weights_manifest(packed_dir)
-    if manifest.get("format") != PACKED_WEIGHTS_FORMAT:
+    supported_formats = (PACKED_WEIGHTS_FORMAT,) + LEGACY_PACKED_WEIGHTS_FORMATS
+    if manifest.get("format") not in supported_formats:
         raise RuntimeError(
             f"unsupported packed weight format {manifest.get('format')!r}; "
-            f"expected {PACKED_WEIGHTS_FORMAT}"
+            f"expected one of {supported_formats}"
         )
     if manifest.get("dtype") != "bfloat16":
         raise RuntimeError(f"packed weight dtype must be bfloat16: {manifest.get('dtype')}")
