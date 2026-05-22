@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generated prefill layout constants for exported_llama3.
+
+Regenerate with:
+    uv run python -m models.fused_prefill.codegen
+
+This file is rendered directly from torch.export.ExportedProgram and intentionally
+does not import IRON runtime modules.
+"""
+
+from __future__ import annotations
+
+
+EXPECTED_PREFILL_LAYERS = {{ layer_indices(exported_program) | length }}
+
+PREFILL_LAYER_WEIGHT_SPECS = (
+{% for spec in prefill_layer_weight_specs(exported_program) %}
+    (
+        "{{ spec["name"] }}",
+        "{{ spec["source_suffix"] }}",
+        {{ "True" if spec["transpose"] else "False" }},
+    ),
+{% endfor %}
+)

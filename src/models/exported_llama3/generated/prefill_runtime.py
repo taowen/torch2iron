@@ -24,7 +24,7 @@ EXPECTED_PREFILL_LAYERS = 16
 def _grouped_query_attention_forward(
     runner,
     config,
-    x,
+    seq_len,
     keys_cache,
     values_cache,
     layer_idx,
@@ -32,7 +32,7 @@ def _grouped_query_attention_forward(
 ):
     aie_ops = runner.aie_ops
     aie_buffers = runner.aie_buffers
-    batch, seq_len, _ = x.shape
+    batch = 1
 
     # Step 1: Linear projections
     aie_ops.prefill.attn_query(
@@ -106,7 +106,6 @@ def _grouped_query_attention_forward(
 
     aie_buffers.prefill.attn_scores_queries_all.to("npu")
     aie_buffers.prefill.attn_scores_keys_all.to("npu")
-    aie_buffers.prefill.attn_scores.to("npu")
 
     for h in range(config.n_heads):
         kv_group = h // group_size
@@ -187,12 +186,11 @@ def _transformer_block_forward(
         aie_buffers.W_norm1[layer_idx],
         aie_buffers.prefill.x_norm,
     )
-    x_norm = aie_buffers.prefill.x_norm.to_torch().unsqueeze(0)[:, :seq_len, :]
 
     attn_output, attn_keys, attn_values = _grouped_query_attention_forward(
         runner,
         config,
-        x_norm,
+        seq_len,
         attn_keys_cache,
         attn_values_cache,
         layer_idx,
@@ -206,16 +204,12 @@ def _transformer_block_forward(
     aie_ops.prefill.residual_add(
         aie_buffers.prefill.x, aie_buffers.prefill.attn_output, aie_buffers.prefill.x
     )
-    x = aie_buffers.prefill.x.to_torch().unsqueeze(0)[:, :seq_len, :]
 
-    aie_buffers.prefill.x.torch_view().unsqueeze(0)[0, :seq_len, :] = x
-    aie_buffers.prefill.x.to("npu")
     aie_ops.prefill.rms_norm(
         aie_buffers.prefill.x,
         aie_buffers.W_norm2[layer_idx],
         aie_buffers.prefill.x_norm,
     )
-    x_norm = aie_buffers.prefill.x_norm.to_torch().unsqueeze(0)[:, :seq_len, :]
 
     _swiglu_ffn_forward(runner, layer_idx)
 

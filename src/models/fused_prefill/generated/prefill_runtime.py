@@ -6,7 +6,7 @@
 """Generated prefill runtime for exported_llama3.
 
 Regenerate with:
-    uv run python -m models.exported_llama3.codegen
+    uv run python -m models.fused_prefill.codegen
 
 The transformer layer skeleton is rendered directly from
 torch.export.ExportedProgram. Low-level staging helpers remain explicit because
@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 
 
-EXPECTED_PREFILL_LAYERS = {{ layer_indices(exported_program) | length }}
+EXPECTED_PREFILL_LAYERS = 16
 
 
 def _grouped_query_attention_forward(
@@ -181,15 +181,12 @@ def _transformer_block_forward(
     aie_ops = runner.aie_ops
     aie_buffers = runner.aie_buffers
 
-{% for node in representative_layer_nodes(exported_program) %}
-{% if target_is(node, "aten.rms_norm.default") and path_endswith(node, "input_layernorm") %}
     aie_ops.prefill.rms_norm(
         aie_buffers.prefill.x,
         aie_buffers.W_norm1[layer_idx],
         aie_buffers.prefill.x_norm,
     )
 
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.q_proj") %}
     attn_output, attn_keys, attn_values = _grouped_query_attention_forward(
         runner,
         config,
@@ -200,7 +197,6 @@ def _transformer_block_forward(
         attn_mask,
     )
 
-{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "self_attn.o_proj") %}
     aie_buffers.prefill.attn_output.torch_view().unsqueeze(0)[
         0, :seq_len, :
     ] = attn_output
@@ -209,23 +205,18 @@ def _transformer_block_forward(
         aie_buffers.prefill.x, aie_buffers.prefill.attn_output, aie_buffers.prefill.x
     )
 
-{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "post_attention_layernorm") %}
     aie_ops.prefill.rms_norm(
         aie_buffers.prefill.x,
         aie_buffers.W_norm2[layer_idx],
         aie_buffers.prefill.x_norm,
     )
 
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.gate_proj") %}
     _swiglu_ffn_forward(runner, layer_idx)
 
-{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "mlp.down_proj") %}
     aie_ops.prefill.residual_add(
         aie_buffers.prefill.x, aie_buffers.prefill.ffn_output, aie_buffers.prefill.x
     )
 
-{% endif %}
-{% endfor %}
     return attn_keys, attn_values
 
 
