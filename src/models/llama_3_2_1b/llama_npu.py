@@ -582,7 +582,6 @@ class AIELlamaOperators:
             input_args=[  # arguments that change between invocations of the fused kernel and therefore need to be synced on each token
                 "x",
                 "rope_angles",
-                "attention_mask",
             ],
             output_args=[
                 "logits",
@@ -1192,34 +1191,59 @@ def llama_forward_pass_prefill(config, state):
 # ##########################################################################
 
 
+def sync_decode_attention_mask_full(config, mask_buf):
+    itemsize = mask_buf.dtype.itemsize
+    sync_direction = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+    mask_buf.buffer_object().sync(
+        sync_direction,
+        config.n_heads * max_seq_len * itemsize,
+        0,
+    )
+    mask_buf.device = "npu"
+
+
+def sync_decode_attention_mask_range(config, mask_buf, start_col, end_col):
+    if end_col <= start_col:
+        return
+
+    itemsize = mask_buf.dtype.itemsize
+    sync_bytes = (end_col - start_col) * itemsize
+    sync_direction = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+    mask_bo = mask_buf.buffer_object()
+    for head_idx in range(config.n_heads):
+        offset_elements = head_idx * max_seq_len + start_col
+        mask_bo.sync(sync_direction, sync_bytes, offset_elements * itemsize)
+    mask_buf.device = "npu"
+
+
 def update_decode_attention_mask(config, num_preceding_tokens):
     current_slot = aie_ops.decode.current_cache_slot
-    mask = (
-        aie_ops.decode.fused.get_buffer("attention_mask")
-        .torch_view()
-        .view(config.n_heads, max_seq_len)
-    )
+    mask_buf = aie_ops.decode.fused.get_buffer("attention_mask")
+    mask = mask_buf.torch_view().view(config.n_heads, max_seq_len)
     valid_until = getattr(aie_ops.decode, "mask_valid_until", 0)
     if num_preceding_tokens < valid_until:
         valid_until = 0
     if valid_until == 0:
         mask.fill_(-10000.0)
         mask[:, current_slot] = 0.0
-    if num_preceding_tokens > valid_until:
+        mask[:, :num_preceding_tokens] = 0.0
+        sync_decode_attention_mask_full(config, mask_buf)
+    elif num_preceding_tokens > valid_until:
         mask[:, valid_until:num_preceding_tokens] = 0.0
+        sync_decode_attention_mask_range(
+            config, mask_buf, valid_until, num_preceding_tokens
+        )
     aie_ops.decode.mask_valid_until = num_preceding_tokens
 
 
 def initialize_decode_attention_mask(config, num_preceding_tokens):
     current_slot = aie_ops.decode.current_cache_slot
-    mask = (
-        aie_ops.decode.fused.get_buffer("attention_mask")
-        .torch_view()
-        .view(config.n_heads, max_seq_len)
-    )
+    mask_buf = aie_ops.decode.fused.get_buffer("attention_mask")
+    mask = mask_buf.torch_view().view(config.n_heads, max_seq_len)
     mask.fill_(-10000.0)
     mask[:, :num_preceding_tokens] = 0.0
     mask[:, current_slot] = 0.0
+    sync_decode_attention_mask_full(config, mask_buf)
     aie_ops.decode.mask_valid_until = num_preceding_tokens
 
 
