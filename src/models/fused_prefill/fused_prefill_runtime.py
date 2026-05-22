@@ -14,10 +14,6 @@ from models.fused_prefill.decode_packet_cache import (
     sync_decode_packet_range,
 )
 from models.fused_prefill.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
-from models.fused_prefill.runtime_config import (
-    PREFILL_CHUNK_COMPUTE_ROWS,
-    PREFILL_CHUNK_SIZE,
-)
 
 
 def _zero_prefill_packet_caches(config, fused):
@@ -34,16 +30,17 @@ def _append_prefill_chunk_to_packet_cache(
     layer_idx,
     chunk_start,
     valid_len,
+    chunk_size,
 ):
     present_key = (
         fused.get_buffer(f"present_keys_{layer_idx}")
         .torch_view()
-        .view(config.n_kv_groups, PREFILL_CHUNK_SIZE, config.head_dim)
+        .view(config.n_kv_groups, chunk_size, config.head_dim)
     )
     present_value = (
         fused.get_buffer(f"present_values_{layer_idx}")
         .torch_view()
-        .view(config.n_kv_groups, PREFILL_CHUNK_SIZE, config.head_dim)
+        .view(config.n_kv_groups, chunk_size, config.head_dim)
     )
     packet_cache = fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
     packet = packet_cache.torch_view()
@@ -84,8 +81,11 @@ def _run_lm_head_for_last_chunk(runner, hidden_out, valid_len):
 
 def fused_prefill_forward_pass(runner, state):
     config = runner.config
-    max_seq_len = runner.max_seq_len
-    fused = runner.aie_ops.prefill.fused
+    max_seq_len = runner.prefill_max_seq_len
+    prefill_ops = runner.aie_ops.prefill
+    fused = prefill_ops.fused
+    chunk_size = prefill_ops.chunk_size
+    compute_rows = prefill_ops.compute_rows
 
     _, seq_len = state.token_ids.shape
     if seq_len > max_seq_len:
@@ -99,12 +99,12 @@ def fused_prefill_forward_pass(runner, state):
     tok_emb_weight = config.weights["model.embed_tokens.weight"]
     last_logits = None
 
-    for chunk_start in range(0, seq_len, PREFILL_CHUNK_SIZE):
-        valid_len = min(PREFILL_CHUNK_SIZE, seq_len - chunk_start)
+    for chunk_start in range(0, seq_len, chunk_size):
+        valid_len = min(chunk_size, seq_len - chunk_start)
         chunk_end = chunk_start + valid_len
 
         rope_angles = fused.get_buffer("rope_angles").torch_view().view(
-            PREFILL_CHUNK_COMPUTE_ROWS, config.head_dim
+            compute_rows, config.head_dim
         )
         rope_angles.zero_()
         rope_angles[:valid_len, :] = config.angles[chunk_start:chunk_end]
@@ -112,7 +112,7 @@ def fused_prefill_forward_pass(runner, state):
         chunk_token_ids = state.token_ids[:, chunk_start:chunk_end]
         x = torch.nn.functional.embedding(chunk_token_ids, tok_emb_weight)
         x_input = fused.get_buffer("x").torch_view().view(
-            PREFILL_CHUNK_COMPUTE_ROWS, config.emb_dim
+            compute_rows, config.emb_dim
         )
         x_input.zero_()
         x_input[:valid_len, :] = x[0, :, :]
@@ -127,11 +127,12 @@ def fused_prefill_forward_pass(runner, state):
                 layer_idx,
                 chunk_start,
                 valid_len,
+                chunk_size,
             )
 
         if chunk_end == seq_len:
             hidden_out = fused.get_buffer("hidden_out").torch_view().view(
-                PREFILL_CHUNK_COMPUTE_ROWS, config.emb_dim
+                compute_rows, config.emb_dim
             )
             last_logits = _run_lm_head_for_last_chunk(runner, hidden_out, valid_len)
 
