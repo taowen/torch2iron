@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Next steps for decode performance:
-# [ ] All decode operators operate on 2048-padded buffers; instead, should bin into shorter sequence lengths and call smaller operators
+# [ ] Keep multiple decode length variants loaded at once instead of compiling one static bin per run
 # [ ] Opportunity to fuse data layout transformations (e.g., transpose ops) onto end of other operations (e.g., transpose after RoPE)
 # [ ] Some kernels are not optimized; e.g., softmax masking is using scalar cores
 # [ ] Fine-tune parameters of operators (e.g., num AIE columns, tile sizes)
@@ -40,10 +40,27 @@ from torch2iron.operators import (
 )
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor, xrt as pyxrt
 
-max_seq_len = 2048
+MAX_SUPPORTED_SEQ_LEN = 2048
+SEQ_LEN_BIN_SIZE = 512
+MIN_COMPILED_SEQ_LEN = 512
+max_seq_len = MAX_SUPPORTED_SEQ_LEN
 
 aie_ops = None
 aie_buffers = None
+
+
+def select_compiled_seq_len(required_tokens):
+    if required_tokens > MAX_SUPPORTED_SEQ_LEN:
+        raise ValueError(
+            f"required sequence length {required_tokens} exceeds "
+            f"MAX_SUPPORTED_SEQ_LEN={MAX_SUPPORTED_SEQ_LEN}"
+        )
+    rounded = (
+        (required_tokens + SEQ_LEN_BIN_SIZE - 1)
+        // SEQ_LEN_BIN_SIZE
+        * SEQ_LEN_BIN_SIZE
+    )
+    return max(MIN_COMPILED_SEQ_LEN, rounded)
 
 
 # AIE Operator Configuration
@@ -61,7 +78,8 @@ class AIEDecodeOperations:
 class AIELlamaOperators:
 
     def __init__(self, config, prompt_len):
-        self.context = AIEContext()
+        build_suffix = f"seq{prompt_len}"
+        self.context = AIEContext(build_dir=Path("build") / build_suffix)
         self.context.build_dir.mkdir(parents=True, exist_ok=True)
 
         self.prefill = AIEPrefillOperations()
@@ -84,7 +102,11 @@ class AIELlamaOperators:
         )
 
         self.prefill.residual_add = (
-            ElementwiseAdd(size=prompt_len * config.emb_dim, tile_size=config.emb_dim)
+            ElementwiseAdd(
+                size=prompt_len * config.emb_dim,
+                tile_size=config.emb_dim,
+                context=self.context,
+            )
             .compile()
             .get_callable()
         )
@@ -274,7 +296,7 @@ class AIELlamaOperators:
         # Decode operator (everything temporally fused)
         # ##################################################################
 
-        elf_ctx = AIEContext(build_dir="build_elf")
+        elf_ctx = AIEContext(build_dir=Path("build_elf") / build_suffix)
 
         gemv_attn_query_op = GEMV(
             M=config.n_heads * config.head_dim,
@@ -1352,9 +1374,13 @@ def main():
     logging.basicConfig(level=logging.DEBUG)
     args = harness.parse_args()
 
-    assert (
-        max_seq_len >= args.prompt_len + args.num_tokens
-    ), "max_seq_len must be at least prompt_len + num_tokens"
+    required_seq_len = args.prompt_len + args.num_tokens
+    max_seq_len = select_compiled_seq_len(required_seq_len)
+    logging.info(
+        "Using static sequence length %d for %d requested positions",
+        max_seq_len,
+        required_seq_len,
+    )
 
     prompt = harness.get_prompt(args.prompt_len)
 
