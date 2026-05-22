@@ -3,42 +3,27 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export tiny Llama PyTorch modules for graph inspection."""
+"""Export a model package's tiny PyTorch modules for graph inspection."""
 
 from __future__ import annotations
 
 import argparse
 
-import torch
-
-from models.exported_llama3.pytorch_modules import (
-    ExportLlamaDecodeModel,
-    ExportLlamaPrefillModel,
-    LlamaExportConfig,
-    example_decode_args,
-    example_prefill_args,
+from torch2iron.export.model_tools import (
+    DEFAULT_MODEL_PACKAGE,
+    export_program,
+    load_model_export_tools,
+    make_llama_export_config,
 )
 
 
-def export_program(
-    config: LlamaExportConfig,
-    mode: str,
-) -> torch.export.ExportedProgram:
-    if mode == "prefill":
-        model = ExportLlamaPrefillModel(config).eval()
-        args = example_prefill_args(config)
-    elif mode == "decode":
-        model = ExportLlamaDecodeModel(config).eval()
-        args = example_decode_args(config)
-    else:
-        raise ValueError(f"unsupported mode: {mode}")
-
-    exported_program: torch.export.ExportedProgram = torch.export.export(model, args)
-    return exported_program
-
-
 def _parse_args(argv: list[str] | None = None):
-    parser = argparse.ArgumentParser(description="Inspect exported Llama graphs")
+    parser = argparse.ArgumentParser(description="Inspect torch.export graphs")
+    parser.add_argument(
+        "--model-package",
+        default=DEFAULT_MODEL_PACKAGE,
+        help="Model package containing pytorch_modules.py and runtime_config.py.",
+    )
     parser.add_argument(
         "--mode",
         choices=("prefill", "decode"),
@@ -58,18 +43,19 @@ def _parse_args(argv: list[str] | None = None):
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    config = LlamaExportConfig(
+    tools = load_model_export_tools(args.model_package)
+    config = make_llama_export_config(
+        tools,
         vocab_size=args.vocab_size,
-        emb_dim=args.heads * args.head_dim,
-        n_layers=args.layers,
-        n_heads=args.heads,
-        n_kv_groups=args.kv_groups,
+        layers=args.layers,
+        heads=args.heads,
+        kv_groups=args.kv_groups,
         head_dim=args.head_dim,
         hidden_dim=args.hidden_dim,
         max_seq_len=args.max_seq_len,
         chunk_size=args.chunk_size,
     )
-    exported_program = export_program(config, args.mode)
+    exported_program = export_program(tools, config, args.mode)
     print(exported_program.graph_module.code)
     return 0
 

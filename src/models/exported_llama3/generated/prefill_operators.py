@@ -6,7 +6,7 @@
 """Generated fused prefill ELF builders for exported_llama3.
 
 Regenerate with:
-    uv run python -m models.exported_llama3.codegen
+    uv run python -m torch2iron.export.codegen --model-package models.exported_llama3
 
 The model topology, layer count, and layer weight list come from
 torch.export.ExportedProgram. Runtime-specific tiling parameters still enter
@@ -347,28 +347,34 @@ def build_prefill_fused_op(
 
     runlist = []
     for layer_idx in range(config.n_layers):
+        runlist.append((rms_norm_op, "x", f"W_norm1_{layer_idx}", "x_norm"))
+        runlist.append(
+            (
+                attn_query_op,
+                "x_norm",
+                f"W_attn_query_prefill_{layer_idx}",
+                "queries",
+            )
+        )
+        runlist.append(
+            (
+                attn_key_value_op,
+                "x_norm",
+                f"W_attn_key_prefill_{layer_idx}",
+                "keys",
+            )
+        )
+        runlist.append(
+            (
+                attn_key_value_op,
+                "x_norm",
+                f"W_attn_value_prefill_{layer_idx}",
+                "values",
+            )
+        )
+        runlist.append((rope_queries_op, "queries", "rope_angles", "queries"))
         runlist.extend(
             [
-                (rms_norm_op, "x", f"W_norm1_{layer_idx}", "x_norm"),
-                (
-                    attn_query_op,
-                    "x_norm",
-                    f"W_attn_query_prefill_{layer_idx}",
-                    "queries",
-                ),
-                (
-                    attn_key_value_op,
-                    "x_norm",
-                    f"W_attn_key_prefill_{layer_idx}",
-                    "keys",
-                ),
-                (
-                    attn_key_value_op,
-                    "x_norm",
-                    f"W_attn_value_prefill_{layer_idx}",
-                    "values",
-                ),
-                (rope_queries_op, "queries", "rope_angles", "queries"),
                 (rope_keys_op, "keys", "rope_angles", "keys"),
                 (present_kv_copy_op, "keys", _present_key_name(layer_idx)),
                 (present_kv_copy_op, "values", _present_value_name(layer_idx)),
@@ -393,29 +399,37 @@ def build_prefill_fused_op(
                     ),
                 ]
             )
+        runlist.append(
+            (
+                attn_output_op,
+                "attn_context",
+                f"W_attn_output_prefill_{layer_idx}",
+                "attn_output",
+            )
+        )
+        runlist.append((residual_add_op, "x", "attn_output", "x"))
+        runlist.append((rms_norm_op, "x", f"W_norm2_{layer_idx}", "x_norm"))
+        runlist.append(
+            (ffn_up_gate_op, "x_norm", f"W_ffn_gate_prefill_{layer_idx}", "ffn_gate")
+        )
+        runlist.append(
+            (ffn_up_gate_op, "x_norm", f"W_ffn_up_prefill_{layer_idx}", "ffn_up")
+        )
         runlist.extend(
             [
-                (
-                    attn_output_op,
-                    "attn_context",
-                    f"W_attn_output_prefill_{layer_idx}",
-                    "attn_output",
-                ),
-                (residual_add_op, "x", "attn_output", "x"),
-                (rms_norm_op, "x", f"W_norm2_{layer_idx}", "x_norm"),
-                (ffn_up_gate_op, "x_norm", f"W_ffn_gate_prefill_{layer_idx}", "ffn_gate"),
-                (ffn_up_gate_op, "x_norm", f"W_ffn_up_prefill_{layer_idx}", "ffn_up"),
                 (ffn_silu_op, "ffn_gate", "ffn_gate"),
                 (ffn_mul_op, "ffn_gate", "ffn_up", "ffn_hidden"),
-                (
-                    ffn_down_op,
-                    "ffn_hidden",
-                    f"W_ffn_down_prefill_{layer_idx}",
-                    "ffn_output",
-                ),
-                (residual_add_op, "x", "ffn_output", "x"),
             ]
         )
+        runlist.append(
+            (
+                ffn_down_op,
+                "ffn_hidden",
+                f"W_ffn_down_prefill_{layer_idx}",
+                "ffn_output",
+            )
+        )
+        runlist.append((residual_add_op, "x", "ffn_output", "x"))
 
     runlist.append((rms_norm_op, "x", "W_final_norm", "hidden_out"))
 

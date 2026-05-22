@@ -7,7 +7,7 @@
 
 These modules are not wired into the runtime path.  They keep the Llama block
 structure and a few important semantic boundaries visible so
-``dump_exported_program.py`` can show what PyTorch export actually emits.
+``torch2iron.export.dump_exported_program`` can show what PyTorch export emits.
 """
 
 from __future__ import annotations

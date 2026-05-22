@@ -6,7 +6,7 @@
 """Generated fused prefill ELF builders for exported_llama3.
 
 Regenerate with:
-    uv run python -m models.exported_llama3.codegen
+    uv run python -m {{ codegen_module }} --model-package {{ model_package }}
 
 The model topology, layer count, and layer weight list come from
 torch.export.ExportedProgram. Runtime-specific tiling parameters still enter
@@ -32,12 +32,12 @@ from torch2iron.operators import (
     StridedCopy,
 )
 
-from models.exported_llama3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
-from models.exported_llama3.generated.prefill_layout import (
+from {{ model_package }}.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
+from {{ model_package }}.generated.prefill_layout import (
     EXPECTED_PREFILL_LAYERS,
     PREFILL_LAYER_WEIGHT_SPECS,
 )
-from models.exported_llama3.runtime_config import DECODE_ATTN_CHUNK_SIZE
+from {{ model_package }}.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
 BF16_BYTES = 2
@@ -347,33 +347,51 @@ def build_prefill_fused_op(
 
     runlist = []
     for layer_idx in range(config.n_layers):
+{% set ns = namespace(rope_index=0) %}
+{% for node in representative_layer_nodes(exported_program) %}
+{% if target_is(node, "aten.rms_norm.default") and path_endswith(node, "input_layernorm") %}
+        runlist.append((rms_norm_op, "x", f"W_norm1_{layer_idx}", "x_norm"))
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.q_proj") %}
+        runlist.append(
+            (
+                attn_query_op,
+                "x_norm",
+                f"W_attn_query_prefill_{layer_idx}",
+                "queries",
+            )
+        )
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.k_proj") %}
+        runlist.append(
+            (
+                attn_key_value_op,
+                "x_norm",
+                f"W_attn_key_prefill_{layer_idx}",
+                "keys",
+            )
+        )
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.v_proj") %}
+        runlist.append(
+            (
+                attn_key_value_op,
+                "x_norm",
+                f"W_attn_value_prefill_{layer_idx}",
+                "values",
+            )
+        )
+{% elif target_is(node, "torch2iron.rope.default") %}
+{% set ns.rope_index = ns.rope_index + 1 %}
+{% if ns.rope_index == 1 %}
+        runlist.append((rope_queries_op, "queries", "rope_angles", "queries"))
+{% elif ns.rope_index == 2 %}
         runlist.extend(
             [
-                (rms_norm_op, "x", f"W_norm1_{layer_idx}", "x_norm"),
-                (
-                    attn_query_op,
-                    "x_norm",
-                    f"W_attn_query_prefill_{layer_idx}",
-                    "queries",
-                ),
-                (
-                    attn_key_value_op,
-                    "x_norm",
-                    f"W_attn_key_prefill_{layer_idx}",
-                    "keys",
-                ),
-                (
-                    attn_key_value_op,
-                    "x_norm",
-                    f"W_attn_value_prefill_{layer_idx}",
-                    "values",
-                ),
-                (rope_queries_op, "queries", "rope_angles", "queries"),
                 (rope_keys_op, "keys", "rope_angles", "keys"),
                 (present_kv_copy_op, "keys", _present_key_name(layer_idx)),
                 (present_kv_copy_op, "values", _present_value_name(layer_idx)),
             ]
         )
+{% endif %}
+{% elif target_is(node, "aten.softmax.int") %}
         for q_block_idx in range(q_head_blocks_per_group):
             runlist.extend(
                 [
@@ -393,31 +411,53 @@ def build_prefill_fused_op(
                     ),
                 ]
             )
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.o_proj") %}
+        runlist.append(
+            (
+                attn_output_op,
+                "attn_context",
+                f"W_attn_output_prefill_{layer_idx}",
+                "attn_output",
+            )
+        )
+{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "self_attn.o_proj") %}
+        runlist.append((residual_add_op, "x", "attn_output", "x"))
+{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "post_attention_layernorm") %}
+        runlist.append((rms_norm_op, "x", f"W_norm2_{layer_idx}", "x_norm"))
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.gate_proj") %}
+        runlist.append(
+            (ffn_up_gate_op, "x_norm", f"W_ffn_gate_prefill_{layer_idx}", "ffn_gate")
+        )
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.up_proj") %}
+        runlist.append(
+            (ffn_up_gate_op, "x_norm", f"W_ffn_up_prefill_{layer_idx}", "ffn_up")
+        )
+{% elif target_is(node, "torch2iron.swiglu.default") %}
         runlist.extend(
             [
-                (
-                    attn_output_op,
-                    "attn_context",
-                    f"W_attn_output_prefill_{layer_idx}",
-                    "attn_output",
-                ),
-                (residual_add_op, "x", "attn_output", "x"),
-                (rms_norm_op, "x", f"W_norm2_{layer_idx}", "x_norm"),
-                (ffn_up_gate_op, "x_norm", f"W_ffn_gate_prefill_{layer_idx}", "ffn_gate"),
-                (ffn_up_gate_op, "x_norm", f"W_ffn_up_prefill_{layer_idx}", "ffn_up"),
                 (ffn_silu_op, "ffn_gate", "ffn_gate"),
                 (ffn_mul_op, "ffn_gate", "ffn_up", "ffn_hidden"),
-                (
-                    ffn_down_op,
-                    "ffn_hidden",
-                    f"W_ffn_down_prefill_{layer_idx}",
-                    "ffn_output",
-                ),
-                (residual_add_op, "x", "ffn_output", "x"),
             ]
         )
+{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.down_proj") %}
+        runlist.append(
+            (
+                ffn_down_op,
+                "ffn_hidden",
+                f"W_ffn_down_prefill_{layer_idx}",
+                "ffn_output",
+            )
+        )
+{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "mlp.down_proj") %}
+        runlist.append((residual_add_op, "x", "ffn_output", "x"))
+{% endif %}
+{% endfor %}
 
+{% for node in call_function_nodes(exported_program) %}
+{% if target_is(node, "aten.rms_norm.default") and path_endswith(node, "norm") and layer_idx(node) is none %}
     runlist.append((rms_norm_op, "x", "W_final_norm", "hidden_out"))
+{% endif %}
+{% endfor %}
 
     output_args = [
         "hidden_out",

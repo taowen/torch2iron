@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate exported_llama3 runtime code directly from torch.export graphs."""
+"""Generate runtime code directly from torch.export graphs."""
 
 from __future__ import annotations
 
@@ -13,14 +13,15 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
-from models.exported_llama3.dump_exported_program import export_program
-from models.exported_llama3.pytorch_modules import LlamaExportConfig
-from models.exported_llama3.runtime_config import (
-    DECODE_ATTN_CHUNK_SIZE,
-    MIN_COMPILED_SEQ_LEN,
+from torch2iron.export.model_tools import (
+    DEFAULT_MODEL_PACKAGE,
+    ModelExportTools,
+    export_program,
+    load_model_export_tools,
 )
 
 
+CODEGEN_MODULE = "torch2iron.export.codegen"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -224,7 +225,7 @@ def _parameter_targets(exported_program) -> dict[str, str]:
     }
 
 
-def decode_weight_source(exported_program, node) -> str | None:
+def weight_source(exported_program, node) -> str | None:
     if target_is(node, "aten.linear.default"):
         parameter_node = node.args[1]
     elif target_is(node, "aten.rms_norm.default"):
@@ -233,10 +234,6 @@ def decode_weight_source(exported_program, node) -> str | None:
         return None
 
     return _parameter_targets(exported_program)[parameter_node.name]
-
-
-def weight_source(exported_program, node) -> str | None:
-    return decode_weight_source(exported_program, node)
 
 
 def decode_weight_specs(exported_program) -> list[dict[str, object]]:
@@ -279,8 +276,9 @@ def prefill_layer_weight_specs(exported_program) -> list[dict[str, object]]:
     return specs
 
 
-def export_decode_program_for_codegen() -> object:
-    config = LlamaExportConfig(
+def export_decode_program_for_codegen(tools: ModelExportTools) -> object:
+    runtime_config = tools.runtime_config
+    config = tools.config_cls(
         vocab_size=128,
         emb_dim=32,
         n_layers=16,
@@ -288,14 +286,15 @@ def export_decode_program_for_codegen() -> object:
         n_kv_groups=2,
         head_dim=8,
         hidden_dim=64,
-        max_seq_len=MIN_COMPILED_SEQ_LEN,
-        chunk_size=DECODE_ATTN_CHUNK_SIZE,
+        max_seq_len=runtime_config.MIN_COMPILED_SEQ_LEN,
+        chunk_size=runtime_config.DECODE_ATTN_CHUNK_SIZE,
     )
-    return export_program(config, "decode")
+    return export_program(tools, config, "decode")
 
 
-def export_prefill_program_for_codegen() -> object:
-    config = LlamaExportConfig(
+def export_prefill_program_for_codegen(tools: ModelExportTools) -> object:
+    runtime_config = tools.runtime_config
+    config = tools.config_cls(
         vocab_size=128,
         emb_dim=32,
         n_layers=16,
@@ -304,12 +303,12 @@ def export_prefill_program_for_codegen() -> object:
         head_dim=8,
         hidden_dim=64,
         max_seq_len=8,
-        chunk_size=DECODE_ATTN_CHUNK_SIZE,
+        chunk_size=runtime_config.DECODE_ATTN_CHUNK_SIZE,
     )
-    return export_program(config, "prefill")
+    return export_program(tools, config, "prefill")
 
 
-def _jinja_env() -> Environment:
+def _jinja_env(*, model_package: str) -> Environment:
     template_dir = Path(__file__).with_name("templates")
     env = Environment(
         loader=FileSystemLoader(template_dir),
@@ -318,6 +317,8 @@ def _jinja_env() -> Environment:
         keep_trailing_newline=True,
     )
     env.globals.update(
+        model_package=model_package,
+        codegen_module=CODEGEN_MODULE,
         call_function_nodes=call_function_nodes,
         path_endswith=path_endswith,
         layer_idx=layer_idx,
@@ -336,73 +337,88 @@ def _jinja_env() -> Environment:
     return env
 
 
-def render_decode_layout(exported_program) -> str:
-    return _jinja_env().get_template("decode_layout.py.j2").render(
-        exported_program=exported_program
-    )
+def render_decode_layout(exported_program, *, model_package: str) -> str:
+    return _jinja_env(model_package=model_package).get_template(
+        "decode_layout.py.j2"
+    ).render(exported_program=exported_program)
 
 
-def render_prefill_layout(exported_program) -> str:
-    return _jinja_env().get_template("prefill_layout.py.j2").render(
-        exported_program=exported_program
-    )
+def render_prefill_layout(exported_program, *, model_package: str) -> str:
+    return _jinja_env(model_package=model_package).get_template(
+        "prefill_layout.py.j2"
+    ).render(exported_program=exported_program)
 
 
-def render_decode_fused(exported_program) -> str:
-    env = _jinja_env()
-    return env.get_template("decode_fused.py.j2").render(
-        exported_program=exported_program
-    )
+def render_decode_fused(exported_program, *, model_package: str) -> str:
+    return _jinja_env(model_package=model_package).get_template(
+        "decode_fused.py.j2"
+    ).render(exported_program=exported_program)
 
 
-def render_prefill_operators(exported_program) -> str:
-    return _jinja_env().get_template("prefill_operators.py.j2").render(
-        exported_program=exported_program
-    )
+def render_prefill_operators(exported_program, *, model_package: str) -> str:
+    return _jinja_env(model_package=model_package).get_template(
+        "prefill_operators.py.j2"
+    ).render(exported_program=exported_program)
 
 
-def render_generated_files() -> dict[str, str]:
-    decode_program = export_decode_program_for_codegen()
-    prefill_program = export_prefill_program_for_codegen()
+def render_generated_files(tools: ModelExportTools) -> dict[str, str]:
+    decode_program = export_decode_program_for_codegen(tools)
+    prefill_program = export_prefill_program_for_codegen(tools)
     return {
-        "decode_layout.py": render_decode_layout(decode_program),
-        "prefill_layout.py": render_prefill_layout(prefill_program),
-        "decode_fused.py": render_decode_fused(decode_program),
-        "prefill_operators.py": render_prefill_operators(prefill_program),
+        "decode_layout.py": render_decode_layout(
+            decode_program, model_package=tools.package_name
+        ),
+        "prefill_layout.py": render_prefill_layout(
+            prefill_program, model_package=tools.package_name
+        ),
+        "decode_fused.py": render_decode_fused(
+            decode_program, model_package=tools.package_name
+        ),
+        "prefill_operators.py": render_prefill_operators(
+            prefill_program, model_package=tools.package_name
+        ),
     }
 
 
 def _parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        description="Generate exported_llama3 runtime code from torch.export graphs"
+        description="Generate runtime code from torch.export graphs"
+    )
+    parser.add_argument(
+        "--model-package",
+        default=DEFAULT_MODEL_PACKAGE,
+        help="Model package containing pytorch_modules.py and runtime_config.py.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).with_name("generated"),
+        default=None,
+        help="Output directory. Defaults to <model-package>/generated.",
     )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Verify that the generated file is current without rewriting it.",
+        help="Verify that the generated files are current without rewriting them.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    rendered_files = render_generated_files()
+    tools = load_model_export_tools(args.model_package)
+    output_dir = args.output_dir or tools.package_dir / "generated"
+    rendered_files = render_generated_files(tools)
     if args.check:
         for name, rendered in rendered_files.items():
-            output = args.output_dir / name
+            output = output_dir / name
             current = output.read_text() if output.exists() else None
             if current != rendered:
                 raise SystemExit(f"{output} is not up to date")
         return 0
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     for name, rendered in rendered_files.items():
-        (args.output_dir / name).write_text(rendered)
+        (output_dir / name).write_text(rendered)
     return 0
 
 

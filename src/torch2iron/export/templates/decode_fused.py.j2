@@ -6,7 +6,7 @@
 """Generated decode fused operator for exported_llama3.
 
 Regenerate with:
-    uv run python -m models.exported_llama3.codegen
+    uv run python -m {{ codegen_module }} --model-package {{ model_package }}
 
 The generator renders this file directly from torch.export.ExportedProgram.
 """
@@ -28,7 +28,7 @@ from torch2iron.operators import (
     StridedCopy,
 )
 
-from models.exported_llama3.generated.decode_layout import (
+from {{ model_package }}.generated.decode_layout import (
     DECODE_LM_HEAD_WEIGHT_NAMES,
     DECODE_OUTPUT_ARGS,
     DECODE_PACKET_CACHE_NAMES,
@@ -36,7 +36,7 @@ from models.exported_llama3.generated.decode_layout import (
     EXPECTED_DECODE_LAYERS,
     EXPORTED_DECODE_CHUNK_SIZE,
 )
-from models.exported_llama3.runtime_config import DECODE_ATTN_CHUNK_SIZE
+from {{ model_package }}.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
 def build_decode_fused_op(config, prompt_len, build_suffix):

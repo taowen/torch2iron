@@ -6,7 +6,7 @@
 """Generated decode fused operator for exported_llama3.
 
 Regenerate with:
-    uv run python -m models.exported_llama3.codegen
+    uv run python -m torch2iron.export.codegen --model-package models.exported_llama3
 
 The generator renders this file directly from torch.export.ExportedProgram.
 """

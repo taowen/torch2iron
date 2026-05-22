@@ -6,7 +6,7 @@
 """Generated prefill layout constants for exported_llama3.
 
 Regenerate with:
-    uv run python -m models.exported_llama3.codegen
+    uv run python -m torch2iron.export.codegen --model-package models.exported_llama3
 
 This file is rendered directly from torch.export.ExportedProgram and intentionally
 does not import IRON runtime modules.
