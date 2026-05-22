@@ -18,23 +18,30 @@ from models.exported_llama3.aie_buffers import AIELlamaBuffers
 from models.exported_llama3.aie_operators import AIELlamaOperators
 from models.exported_llama3.decode_packet_cache import (
     append_decode_kv_cache,
-    initialize_decode_packet_cache,
+    copy_decode_packet_cache_tokens,
+    mark_decode_current_cache_slot,
 )
 from models.exported_llama3.llama_packed_weights import (
     default_llama_packed_weights_dir,
     write_llama_packed_weight_artifact,
 )
-from models.exported_llama3.generated.prefill_runtime import prefill_forward_pass
-from models.exported_llama3.runtime_config import select_compiled_seq_len
+from models.exported_llama3.prefill_runtime import prefill_forward_pass
+from models.exported_llama3.runtime_config import (
+    select_compiled_seq_len,
+    select_decode_context_len,
+    select_decode_variant_seq_len,
+)
 import logging
 
 
 class LlamaNpuRunner:
-    def __init__(self, config, static_seq_len):
+    def __init__(self, config, prefill_seq_len, decode_max_seq_len):
         self.config = config
-        self.max_seq_len = static_seq_len
-        self.aie_ops = AIELlamaOperators(config, static_seq_len)
-        self.aie_buffers = AIELlamaBuffers(config, static_seq_len, self.aie_ops)
+        self.prefill_max_seq_len = prefill_seq_len
+        self.max_seq_len = decode_max_seq_len
+        self.aie_ops = AIELlamaOperators(config, prefill_seq_len, decode_max_seq_len)
+        self.aie_buffers = AIELlamaBuffers(config, decode_max_seq_len, self.aie_ops)
+        self.active_decode_variant = None
 
     def forward_pass(self, config, state):
         if config is not self.config:
@@ -57,17 +64,67 @@ class LlamaNpuRunner:
         return _decode_forward_pass(self, self.config, state)
 
     def sync_prefill_cache_to_decode(self, state):
-        # Pack prefill KV state into the fused decode packet cache.
-        for layer_idx in range(self.config.n_layers):
-            initialize_decode_packet_cache(
-                self.config,
-                self.aie_ops,
+        self.ensure_decode_variant(state.num_preceding_tokens)
+
+    def _select_decode_variant_seq_len(self, valid_tokens_after_decode):
+        variant_seq_lens = self.aie_ops.decode.variant_seq_lens
+        if valid_tokens_after_decode + 1 <= self.max_seq_len:
+            return select_decode_variant_seq_len(
+                valid_tokens_after_decode + 1,
                 self.max_seq_len,
-                layer_idx,
-                self.aie_buffers.keys_cache[layer_idx].to_torch(),
-                self.aie_buffers.values_cache[layer_idx].to_torch(),
-                state.num_preceding_tokens,
+                variant_seq_lens,
             )
+        return select_decode_variant_seq_len(
+            valid_tokens_after_decode,
+            self.max_seq_len,
+            variant_seq_lens,
+        )
+
+    def _activate_decode_variant(self, variant):
+        self.active_decode_variant = variant
+        self.aie_ops.decode.active = variant
+        self.aie_ops.decode.fused = variant.fused
+        self.aie_ops.decode.current_cache_slot = variant.current_cache_slot
+        self.aie_ops.decode.max_seq_len = variant.max_seq_len
+
+    def ensure_decode_variant(self, num_valid_tokens):
+        target_seq_len = self._select_decode_variant_seq_len(num_valid_tokens + 1)
+        target = self.aie_ops.decode.variants[target_seq_len]
+        if self.active_decode_variant is target:
+            return target
+
+        source = self.active_decode_variant
+        if source is None:
+            src_fused = self.aie_ops.prefill.fused
+            src_max_seq_len = self.prefill_max_seq_len
+            sync_src_from_npu = False
+        else:
+            src_fused = source.fused
+            src_max_seq_len = source.max_seq_len
+            sync_src_from_npu = True
+
+        if target.fused.kv_cache_buffer is src_fused.kv_cache_buffer:
+            mark_decode_current_cache_slot(
+                self.config,
+                target.fused,
+                target.max_seq_len,
+                target.current_cache_slot,
+            )
+        else:
+            copy_decode_packet_cache_tokens(
+                self.config,
+                src_fused,
+                src_max_seq_len,
+                target.fused,
+                target.max_seq_len,
+                num_valid_tokens,
+                target.current_cache_slot,
+                sync_src_from_npu=sync_src_from_npu,
+            )
+
+        self._activate_decode_variant(target)
+        logging.info("Using decode seq%d ELF", target.max_seq_len)
+        return target
 
 
 # Decode
@@ -75,54 +132,58 @@ class LlamaNpuRunner:
 
 
 def _decode_forward_pass(runner, config, state):
-    aie_ops = runner.aie_ops
-    max_seq_len = runner.max_seq_len
-
     _, seq_len = state.token_ids.shape
     assert seq_len == 1
-    assert state.num_preceding_tokens < max_seq_len
+    assert state.num_preceding_tokens < runner.max_seq_len
+    variant = runner.ensure_decode_variant(state.num_preceding_tokens)
+    assert state.num_preceding_tokens < variant.max_seq_len
+    fused = variant.fused
 
     # Prefill RoPE angle look-up tables
     angles_slice = config.angles[
         state.num_preceding_tokens : state.num_preceding_tokens + seq_len
     ]
-    aie_ops.decode.fused.get_buffer("rope_angles").torch_view()[
-        :
-    ] = angles_slice.flatten()
+    fused.get_buffer("rope_angles").torch_view()[:] = angles_slice.flatten()
 
     # Token embedding (on CPU)
     tok_emb_weight = config.weights["model.embed_tokens.weight"]
     x = torch.nn.functional.embedding(state.token_ids, tok_emb_weight)
-    aie_ops.decode.fused.get_buffer("x").torch_view().view(-1, config.emb_dim)[
-        :seq_len, :
-    ] = x
+    fused.get_buffer("x").torch_view().view(-1, config.emb_dim)[:seq_len, :] = x
 
     # Fused NPU operator for all of decode (16 transformer blocks + final norm + final linear layer)
-    aie_ops.decode.fused.input_buffer.to("cpu")
-    aie_ops.decode.fused()  # FusedFullELFCallable.__call__() syncs output_buffer to cpu
-    append_decode_kv_cache(config, aie_ops, max_seq_len, state.num_preceding_tokens)
-    logits = aie_ops.decode.fused.get_buffer("logits").torch_view().view(
-        1, 1, config.vocab_size
+    fused.input_buffer.to("cpu")
+    fused()  # FusedFullELFCallable.__call__() syncs output_buffer to cpu
+    append_decode_kv_cache(
+        config,
+        fused,
+        variant.max_seq_len,
+        variant.current_cache_slot,
+        state.num_preceding_tokens,
     )
+    logits = fused.get_buffer("logits").torch_view().view(1, 1, config.vocab_size)
 
     return logits, state
 
 
 def main():
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     args = harness.parse_args()
-
-    required_seq_len = args.prompt_len + args.num_tokens
-    max_seq_len = select_compiled_seq_len(required_seq_len)
-    logging.info(
-        "Using static sequence length %d for %d requested positions",
-        max_seq_len,
-        required_seq_len,
-    )
 
     prompt = harness.get_prompt(args.prompt_len)
 
     config, state = harness.init(args.weights_path, args.tokenizer_path, prompt=prompt)
+    prompt_tokens = state.token_ids.shape[1]
+    required_seq_len = prompt_tokens + args.num_tokens
+    prefill_seq_len = select_compiled_seq_len(prompt_tokens)
+    max_seq_len = select_decode_context_len(required_seq_len)
+    logging.info(
+        "Using prefill sequence length %d and decode context %d for %d requested positions (%d prompt tokens)",
+        prefill_seq_len,
+        max_seq_len,
+        required_seq_len,
+        prompt_tokens,
+    )
+
     packed_weights_dir = (
         Path(args.packed_weights_dir)
         if args.packed_weights_dir is not None
@@ -139,7 +200,7 @@ def main():
         print(f"packed_total_bytes: {manifest['total_bytes']}")
         return
 
-    runner = LlamaNpuRunner(config, max_seq_len)
+    runner = LlamaNpuRunner(config, prefill_seq_len, max_seq_len)
 
     print(prompt, end="", flush=True)
     harness.generate(

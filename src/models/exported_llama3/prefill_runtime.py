@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import torch
 
-from models.fused_prefill.decode_packet_cache import (
+from models.exported_llama3.decode_packet_cache import (
     decode_packet_slot_offsets,
     sync_decode_packet_range,
 )
-from models.fused_prefill.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
+from models.exported_llama3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
 
 
 def _zero_prefill_packet_caches(config, fused):
@@ -79,7 +79,7 @@ def _run_lm_head_for_last_chunk(runner, hidden_out, valid_len):
     )
 
 
-def fused_prefill_forward_pass(runner, state):
+def prefill_forward_pass(runner, state):
     config = runner.config
     max_seq_len = runner.prefill_max_seq_len
     prefill_ops = runner.aie_ops.prefill

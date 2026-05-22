@@ -39,6 +39,11 @@ PREFILL_LAYER_WEIGHT_SPECS = (
         True,
     ),
     (
+        "W_attn_output_prefill",
+        "self_attn.o_proj.weight",
+        True,
+    ),
+    (
         "W_norm2",
         "post_attention_layernorm.weight",
         False,
