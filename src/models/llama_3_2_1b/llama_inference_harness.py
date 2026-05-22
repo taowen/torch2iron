@@ -189,6 +189,22 @@ def parse_args():
         default=40,
         help="Number of tokens to generate (default: 40)",
     )
+    parser.add_argument(
+        "--prepare-weights",
+        action="store_true",
+        help="Write the packed Llama bf16 weight artifact and exit.",
+    )
+    parser.add_argument(
+        "--packed-weights-dir",
+        type=str,
+        default=None,
+        help="Directory containing or receiving llama_iron_packed weights.",
+    )
+    parser.add_argument(
+        "--require-packed-weights",
+        action="store_true",
+        help="Require decode to load the packed weight artifact.",
+    )
     return parser.parse_args()
 
 

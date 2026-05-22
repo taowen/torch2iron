@@ -17,11 +17,20 @@ from pathlib import Path
 import sys
 import ml_dtypes
 from models.llama_3_2_1b import llama_inference_harness as harness
+from models.llama_3_2_1b.llama_weight_layout import (
+    default_llama_packed_weights_dir,
+    iter_llama_decode_weight_specs,
+    llama_decode_lm_head_weight_names,
+    llama_decode_transformer_weight_names,
+    load_llama_packed_segment,
+    validate_llama_packed_weight_artifact,
+    write_llama_packed_weight_artifact,
+)
 import logging
 
 from iron.common.context import AIEContext
 from iron.common.utils import XRTSubBuffer
-from iron.common.fusion import (
+from torch2iron.fusion import (
     FusedMLIROperator,
     FusedFullELFCallable,
 )
@@ -448,6 +457,15 @@ class AIELlamaOperators:
             size=config.emb_dim, tile_size=config.emb_dim // 8, context=elf_ctx
         )
 
+        gemv_out_head_op = GEMV(
+            M=config.vocab_size,
+            K=config.emb_dim,
+            num_aie_columns=8,
+            tile_size_input=4,
+            tile_size_output=32,
+            context=elf_ctx,
+        )
+
         # Create fused operator
 
         packet_cache_buffer_size = packet_elements * 2  # * 2 for bfloat16
@@ -536,6 +554,7 @@ class AIELlamaOperators:
             # </transformer block>
         runlist += [
             (rms_norm_op, "x", "W_final_norm", "hidden_out"),
+            (gemv_out_head_op, "W_out_head", "hidden_out", "logits"),
         ]
 
         self.decode.fused_op = FusedMLIROperator(
@@ -546,7 +565,7 @@ class AIELlamaOperators:
                 "rope_angles",
             ],
             output_args=[
-                "hidden_out",
+                "logits",
                 *[
                     f"present_keys_{layer_idx}"
                     for layer_idx in range(config.n_layers)
@@ -562,63 +581,43 @@ class AIELlamaOperators:
                     for layer_idx in range(config.n_layers)
                 },
             },
+            external_args={
+                "weight": llama_decode_transformer_weight_names(config),
+                "lm_head": llama_decode_lm_head_weight_names(config),
+            },
             context=elf_ctx,
         ).compile()
 
         self.decode.fused = FusedFullELFCallable(self.decode.fused_op)
 
-        # Operator static buffers (weights, LUTs)
-
-        for layer_idx in range(config.n_layers):
-            self.decode.fused.get_buffer(f"W_norm1_{layer_idx}").torch_view()[:] = (
-                config.weights[
-                    f"model.layers.{layer_idx}.input_layernorm.weight"
-                ].flatten()
-            )
-            self.decode.fused.get_buffer(f"W_attn_query_{layer_idx}").torch_view()[
-                :
-            ] = config.weights[
-                f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-            ].flatten()
-            self.decode.fused.get_buffer(f"W_attn_key_{layer_idx}").torch_view()[:] = (
-                config.weights[
-                    f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-                ].flatten()
-            )
-            self.decode.fused.get_buffer(f"W_attn_value_{layer_idx}").torch_view()[
-                :
-            ] = config.weights[
-                f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-            ].flatten()
-            self.decode.fused.get_buffer(
-                f"W_attn_output_decode_{layer_idx}"
-            ).torch_view()[:] = config.weights[
-                f"model.layers.{layer_idx}.self_attn.o_proj.weight"
-            ].flatten()
-            self.decode.fused.get_buffer(f"W_norm2_{layer_idx}").torch_view()[:] = (
-                config.weights[
-                    f"model.layers.{layer_idx}.post_attention_layernorm.weight"
-                ].flatten()
-            )
-            self.decode.fused.get_buffer(f"W_ffn_gate_{layer_idx}").torch_view()[:] = (
-                config.weights[
-                    f"model.layers.{layer_idx}.mlp.gate_proj.weight"
-                ].flatten()
-            )
-            self.decode.fused.get_buffer(f"W_ffn_up_{layer_idx}").torch_view()[:] = (
-                config.weights[f"model.layers.{layer_idx}.mlp.up_proj.weight"].flatten()
-            )
-            self.decode.fused.get_buffer(f"W_ffn_down_{layer_idx}").torch_view()[:] = (
-                config.weights[
-                    f"model.layers.{layer_idx}.mlp.down_proj.weight"
-                ].flatten()
-            )
-        self.decode.fused.get_buffer("W_final_norm").torch_view()[:] = config.weights[
-            "model.norm.weight"
-        ].flatten()
+        load_decode_weight_buffers(config, self.decode.fused)
         self.decode.fused.input_buffer.to("npu")
+        self.decode.fused.weight_buffer.to("npu")
+        self.decode.fused.lm_head_buffer.to("npu")
         self.decode.fused.scratch_buffer.to("npu")
         self.decode.fused.output_buffer.to("npu")
+
+
+def load_decode_weight_buffers(config, fused):
+    packed_dir = getattr(config, "packed_weights_dir", None)
+    require_packed = getattr(config, "require_packed_weights", False)
+    manifest = None
+    if packed_dir is not None and Path(packed_dir).exists():
+        manifest = validate_llama_packed_weight_artifact(config, packed_dir)
+        logging.info("Loading decode weights from packed artifact: %s", packed_dir)
+    elif require_packed:
+        raise FileNotFoundError(f"packed weights required but not found at {packed_dir}")
+    else:
+        logging.info("Loading decode weights from safetensors tensors")
+
+    for spec in iter_llama_decode_weight_specs(config):
+        view = fused.get_buffer(spec["name"]).torch_view()
+        if manifest is None:
+            view[:] = config.weights[spec["source"]].flatten()
+        else:
+            view[:] = load_llama_packed_segment(
+                packed_dir, manifest, spec["name"]
+            ).flatten()
 
 
 # Allocate buffers shared with NPU
@@ -1289,15 +1288,9 @@ def llama_forward_pass_decode(config, state):
     aie_ops.decode.fused.input_buffer.to("cpu")
     aie_ops.decode.fused()  # FusedFullELFCallable.__call__() syncs output_buffer to cpu
     append_decode_kv_cache(config, state.num_preceding_tokens)
-    hidden = (
-        aie_ops.decode.fused.get_buffer("hidden_out")
-        .torch_view()
-        .view(1, 1, config.emb_dim)
+    logits = aie_ops.decode.fused.get_buffer("logits").torch_view().view(
+        1, 1, config.vocab_size
     )
-    logits = torch.nn.functional.linear(
-        hidden.float(),
-        config.weights["model.embed_tokens.weight"].float(),
-    ).to(torch.bfloat16)
 
     return logits, state
 
@@ -1344,6 +1337,21 @@ def main():
     prompt = harness.get_prompt(args.prompt_len)
 
     config, state = harness.init(args.weights_path, args.tokenizer_path, prompt=prompt)
+    packed_weights_dir = (
+        Path(args.packed_weights_dir)
+        if args.packed_weights_dir is not None
+        else default_llama_packed_weights_dir(args.weights_path)
+    )
+    config.packed_weights_dir = packed_weights_dir
+    config.require_packed_weights = args.require_packed_weights
+
+    if args.prepare_weights:
+        manifest = write_llama_packed_weight_artifact(config, packed_weights_dir)
+        print(f"packed_weights_dir: {packed_weights_dir}")
+        print(f"packed_weights_file: {packed_weights_dir / 'weights.bf16.bin'}")
+        print(f"packed_manifest_file: {packed_weights_dir / 'manifest.json'}")
+        print(f"packed_total_bytes: {manifest['total_bytes']}")
+        return
 
     aie_ops = AIELlamaOperators(config, max_seq_len)
     aie_buffers = AIELlamaBuffers(config, max_seq_len, aie_ops)
