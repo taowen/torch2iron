@@ -34,15 +34,14 @@ from torch2iron.operators import (
     SiLU,
     RoPE,
     StridedCopy,
-    Repeat,
-    Softmax,
-    Transpose,
+    LlamaChunkedAttention,
 )
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor, xrt as pyxrt
 
 MAX_SUPPORTED_SEQ_LEN = 2048
 SEQ_LEN_BIN_SIZE = 512
 MIN_COMPILED_SEQ_LEN = 512
+DECODE_ATTN_CHUNK_SIZE = 64
 max_seq_len = MAX_SUPPORTED_SEQ_LEN
 
 aie_ops = None
@@ -329,15 +328,46 @@ class AIELlamaOperators:
         )
 
         self.decode.current_cache_slot = prompt_len - 1
-        strided_copy_cache_op = StridedCopy(
+        packet_chunk_elements = (
+            2 * DECODE_ATTN_CHUNK_SIZE * config.head_dim + DECODE_ATTN_CHUNK_SIZE
+        )
+        packet_elements_per_group = (
+            prompt_len // DECODE_ATTN_CHUNK_SIZE * packet_chunk_elements
+        )
+        packet_elements = config.n_kv_groups * packet_elements_per_group
+        current_chunk = self.decode.current_cache_slot // DECODE_ATTN_CHUNK_SIZE
+        current_row = self.decode.current_cache_slot % DECODE_ATTN_CHUNK_SIZE
+        current_k_packet_offset = (
+            current_chunk * packet_chunk_elements + current_row * config.head_dim
+        )
+        current_v_packet_offset = (
+            current_chunk * packet_chunk_elements
+            + DECODE_ATTN_CHUNK_SIZE * config.head_dim
+            + current_row * config.head_dim
+        )
+
+        strided_copy_packet_key_op = StridedCopy(
             input_sizes=(config.n_kv_groups, config.head_dim),
             input_strides=(config.head_dim, 1),
             input_offset=0,
-            output_sizes=(1, config.n_kv_groups, config.head_dim),
-            output_strides=(0, prompt_len * config.head_dim, 1),
-            output_offset=self.decode.current_cache_slot * config.head_dim,
+            output_sizes=(config.n_kv_groups, config.head_dim),
+            output_strides=(packet_elements_per_group, 1),
+            output_offset=current_k_packet_offset,
             input_buffer_size=1 * config.n_kv_groups * config.head_dim,
-            output_buffer_size=config.n_kv_groups * prompt_len * config.head_dim,
+            output_buffer_size=packet_elements,
+            num_aie_channels=1,
+            context=elf_ctx,
+        )
+
+        strided_copy_packet_value_op = StridedCopy(
+            input_sizes=(config.n_kv_groups, config.head_dim),
+            input_strides=(config.head_dim, 1),
+            input_offset=0,
+            output_sizes=(config.n_kv_groups, config.head_dim),
+            output_strides=(packet_elements_per_group, 1),
+            output_offset=current_v_packet_offset,
+            input_buffer_size=1 * config.n_kv_groups * config.head_dim,
+            output_buffer_size=packet_elements,
             num_aie_channels=1,
             context=elf_ctx,
         )
@@ -355,62 +385,12 @@ class AIELlamaOperators:
             context=elf_ctx,
         )
 
-        # For decode: per head, (1, head_dim) @ (head_dim, max_context_len)
-        # Use GEMV: (max_context_len, head_dim) @ (head_dim,) = (max_context_len,)
-        gemv_attn_scores_op = GEMV(
-            M=prompt_len,  # max possible context length
-            K=config.head_dim,
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=prompt_len // 8,
-            num_batches=config.n_heads,
-            context=elf_ctx,
-        )
-
-        attn_scale_op = ElementwiseMul(
-            size=config.n_heads * prompt_len,
-            tile_size=prompt_len // 8,
-            num_aie_columns=8,
-            context=elf_ctx,
-        )
-
-        attn_mask_add_op = ElementwiseAdd(
-            size=config.n_heads * prompt_len,
-            tile_size=prompt_len // 8,
-            num_aie_columns=8,
-            context=elf_ctx,
-        )
-
-        # Softmax operators for attention weights
-        softmax_op = Softmax(
-            rows=config.n_heads,
-            cols=prompt_len,
-            num_aie_columns=1,
-            num_channels=1,
-            rtp_vector_size=prompt_len,  # Compile with max size
-            context=elf_ctx,
-        )
-
-        # Fused transpose for all attention heads (decode)
-        transpose_values_op = Transpose(
-            M=prompt_len,
-            N=config.head_dim,
-            num_aie_columns=2,
-            num_channels=1,
-            m=256,
-            n=32,
-            s=8,
-            context=elf_ctx,
-        )
-
-        # GEMV for attention context: (head_dim, max_context_len) @ (max_context_len,) = (head_dim,) per head
-        gemv_attn_context_op = GEMV(
-            M=config.head_dim,
-            K=prompt_len,  # max possible context length
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=4,
-            num_batches=config.n_heads,
+        llama_chunked_attention_op = LlamaChunkedAttention(
+            max_seq_len=prompt_len,
+            num_kv_groups=config.n_kv_groups,
+            q_heads_per_group=config.n_heads // config.n_kv_groups,
+            head_dim=config.head_dim,
+            chunk_size=DECODE_ATTN_CHUNK_SIZE,
             context=elf_ctx,
         )
 
@@ -468,32 +448,9 @@ class AIELlamaOperators:
             size=config.emb_dim, tile_size=config.emb_dim // 8, context=elf_ctx
         )
 
-        repeat_interleave_op = Repeat(
-            rows=config.n_kv_groups,
-            cols=prompt_len * config.head_dim,  # Max context length
-            repeat=config.n_heads // config.n_kv_groups,
-            transfer_size=config.head_dim,
-            context=elf_ctx,
-        )
-
-        gemv_out_head_op = GEMV(
-            M=config.vocab_size,
-            K=config.emb_dim,
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=32,
-            context=self.context,
-        )
-
         # Create fused operator
 
-        cache_buffer_size = (
-            config.n_kv_groups * prompt_len * config.head_dim * 2
-        )  # * 2 for bfloat16
-        values_per_head_buffer_size = (
-            prompt_len * config.head_dim * 2
-        )  # * 2 for bfloat16
-        values_buffer_size = config.n_heads * values_per_head_buffer_size
+        packet_cache_buffer_size = packet_elements * 2  # * 2 for bfloat16
 
         runlist = []
         for layer_idx in range(config.n_layers):
@@ -531,36 +488,20 @@ class AIELlamaOperators:
                     (rope_keys_op, "keys", "rope_angles", "keys"),
                     (copy_present_kv_op, "keys", f"present_keys_{layer_idx}"),
                     (copy_present_kv_op, "values", f"present_values_{layer_idx}"),
-                    (strided_copy_cache_op, "keys", f"keys_cache_{layer_idx}"),
-                    (strided_copy_cache_op, "values", f"values_cache_{layer_idx}"),
                     (
-                        repeat_interleave_op,
-                        f"keys_cache_{layer_idx}",
-                        "attn_scores_keys",
+                        strided_copy_packet_key_op,
+                        "keys",
+                        f"packet_cache_{layer_idx}",
                     ),
                     (
-                        repeat_interleave_op,
-                        f"values_cache_{layer_idx}",
-                        "attn_scores_values",
+                        strided_copy_packet_value_op,
+                        "values",
+                        f"packet_cache_{layer_idx}",
                     ),
-                    (gemv_attn_scores_op, "attn_scores_keys", "queries", "attn_scores"),
-                    (attn_scale_op, "attn_scores", "attn_scale_factor", "attn_scores"),
-                    (attn_mask_add_op, "attn_scores", "attention_mask", "attn_scores"),
-                    (softmax_op, "attn_scores", "attn_weights"),
-                ]
-                + [
                     (
-                        transpose_values_op,
-                        f"attn_scores_values[{h * values_per_head_buffer_size}:{(h + 1) * values_per_head_buffer_size}]",
-                        f"attn_scores_values_transposed[{h * values_per_head_buffer_size}:{(h + 1) * values_per_head_buffer_size}]",
-                    )
-                    for h in range(config.n_heads)
-                ]
-                + [
-                    (
-                        gemv_attn_context_op,
-                        "attn_scores_values_transposed",
-                        "attn_weights",
+                        llama_chunked_attention_op,
+                        "queries",
+                        f"packet_cache_{layer_idx}",
                         "attn_context",
                     ),
                     (
@@ -594,8 +535,7 @@ class AIELlamaOperators:
             )
             # </transformer block>
         runlist += [
-            (rms_norm_op, "x", "W_final_norm", "x"),
-            (gemv_out_head_op, "W_out_head", "x", "logits"),
+            (rms_norm_op, "x", "W_final_norm", "hidden_out"),
         ]
 
         self.decode.fused_op = FusedMLIROperator(
@@ -606,7 +546,7 @@ class AIELlamaOperators:
                 "rope_angles",
             ],
             output_args=[
-                "logits",
+                "hidden_out",
                 *[
                     f"present_keys_{layer_idx}"
                     for layer_idx in range(config.n_layers)
@@ -618,16 +558,8 @@ class AIELlamaOperators:
             ],
             buffer_sizes={
                 **{
-                    f"keys_cache_{layer_idx}": cache_buffer_size
+                    f"packet_cache_{layer_idx}": packet_cache_buffer_size
                     for layer_idx in range(config.n_layers)
-                },
-                **{
-                    f"values_cache_{layer_idx}": cache_buffer_size
-                    for layer_idx in range(config.n_layers)
-                },
-                **{
-                    "attn_scores_values": values_buffer_size,
-                    "attn_scores_values_transposed": values_buffer_size,
                 },
             },
             context=elf_ctx,
@@ -681,13 +613,8 @@ class AIELlamaOperators:
                     f"model.layers.{layer_idx}.mlp.down_proj.weight"
                 ].flatten()
             )
-        scale_factor = 1.0 / math.sqrt(config.head_dim)
-        self.decode.fused.get_buffer("attn_scale_factor").fill_(scale_factor)
         self.decode.fused.get_buffer("W_final_norm").torch_view()[:] = config.weights[
             "model.norm.weight"
-        ].flatten()
-        self.decode.fused.get_buffer("W_out_head").torch_view()[:] = config.weights[
-            "model.embed_tokens.weight"
         ].flatten()
         self.decode.fused.input_buffer.to("npu")
         self.decode.fused.scratch_buffer.to("npu")
@@ -1213,75 +1140,106 @@ def llama_forward_pass_prefill(config, state):
 # ##########################################################################
 
 
-def sync_decode_attention_mask_full(config, mask_buf):
-    itemsize = mask_buf.dtype.itemsize
-    sync_direction = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
-    mask_buf.buffer_object().sync(
-        sync_direction,
-        config.n_heads * max_seq_len * itemsize,
-        0,
+def decode_packet_chunk_elements(config):
+    return 2 * DECODE_ATTN_CHUNK_SIZE * config.head_dim + DECODE_ATTN_CHUNK_SIZE
+
+
+def decode_packet_elements_per_group(config):
+    return (max_seq_len // DECODE_ATTN_CHUNK_SIZE) * decode_packet_chunk_elements(
+        config
     )
-    mask_buf.device = "npu"
 
 
-def sync_decode_attention_mask_range(config, mask_buf, start_col, end_col):
-    if end_col <= start_col:
-        return
+def decode_packet_slot_offsets(config, group_idx, slot):
+    chunk_idx = slot // DECODE_ATTN_CHUNK_SIZE
+    row = slot % DECODE_ATTN_CHUNK_SIZE
+    chunk_elements = decode_packet_chunk_elements(config)
+    group_base = group_idx * decode_packet_elements_per_group(config)
+    chunk_base = group_base + chunk_idx * chunk_elements
+    k_offset = chunk_base + row * config.head_dim
+    v_offset = (
+        chunk_base
+        + DECODE_ATTN_CHUNK_SIZE * config.head_dim
+        + row * config.head_dim
+    )
+    mask_offset = chunk_base + 2 * DECODE_ATTN_CHUNK_SIZE * config.head_dim + row
+    return k_offset, v_offset, mask_offset
 
-    itemsize = mask_buf.dtype.itemsize
-    sync_bytes = (end_col - start_col) * itemsize
+
+def sync_decode_packet_range(packet_cache, start_element, num_elements):
+    itemsize = packet_cache.dtype.itemsize
     sync_direction = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
-    mask_bo = mask_buf.buffer_object()
-    for head_idx in range(config.n_heads):
-        offset_elements = head_idx * max_seq_len + start_col
-        mask_bo.sync(sync_direction, sync_bytes, offset_elements * itemsize)
-    mask_buf.device = "npu"
+    packet_cache.buffer_object().sync(
+        sync_direction,
+        num_elements * itemsize,
+        start_element * itemsize,
+    )
+    packet_cache.device = "npu"
 
 
-def update_decode_attention_mask(config, num_preceding_tokens):
+def initialize_decode_packet_cache(
+    config,
+    layer_idx,
+    keys_cache,
+    values_cache,
+    num_preceding_tokens,
+):
+    packet_cache = aie_ops.decode.fused.get_buffer(f"packet_cache_{layer_idx}")
+    packet = packet_cache.torch_view()
+    packet.fill_(0)
+
+    chunk_elements = decode_packet_chunk_elements(config)
+    elements_per_group = decode_packet_elements_per_group(config)
+    num_chunks = max_seq_len // DECODE_ATTN_CHUNK_SIZE
+    valid_tokens = min(num_preceding_tokens, max_seq_len)
     current_slot = aie_ops.decode.current_cache_slot
-    mask_buf = aie_ops.decode.fused.get_buffer("attention_mask")
-    mask = mask_buf.torch_view().view(config.n_heads, max_seq_len)
-    valid_until = getattr(aie_ops.decode, "mask_valid_until", 0)
-    if num_preceding_tokens < valid_until:
-        valid_until = 0
-    if valid_until == 0:
-        mask.fill_(-10000.0)
-        mask[:, current_slot] = 0.0
-        mask[:, :num_preceding_tokens] = 0.0
-        sync_decode_attention_mask_full(config, mask_buf)
-    elif num_preceding_tokens > valid_until:
-        mask[:, valid_until:num_preceding_tokens] = 0.0
-        sync_decode_attention_mask_range(
-            config, mask_buf, valid_until, num_preceding_tokens
-        )
-    aie_ops.decode.mask_valid_until = num_preceding_tokens
 
-
-def initialize_decode_attention_mask(config, num_preceding_tokens):
-    current_slot = aie_ops.decode.current_cache_slot
-    mask_buf = aie_ops.decode.fused.get_buffer("attention_mask")
-    mask = mask_buf.torch_view().view(config.n_heads, max_seq_len)
-    mask.fill_(-10000.0)
-    mask[:, :num_preceding_tokens] = 0.0
-    mask[:, current_slot] = 0.0
-    sync_decode_attention_mask_full(config, mask_buf)
-    aie_ops.decode.mask_valid_until = num_preceding_tokens
-
-
-def sync_decode_cache_slot(config, cache, present, dst_slot):
-    cache_view = cache.data.reshape(config.n_kv_groups, max_seq_len, config.head_dim)
-    itemsize = cache.dtype.itemsize
-    sync_bytes = config.head_dim * itemsize
-    sync_direction = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
-    cache_bo = cache.buffer_object()
     for group_idx in range(config.n_kv_groups):
-        offset_elements = (
-            group_idx * max_seq_len * config.head_dim + dst_slot * config.head_dim
+        group_base = group_idx * elements_per_group
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * DECODE_ATTN_CHUNK_SIZE
+            chunk_end = chunk_start + DECODE_ATTN_CHUNK_SIZE
+            chunk_base = group_base + chunk_idx * chunk_elements
+            k_base = chunk_base
+            v_base = chunk_base + DECODE_ATTN_CHUNK_SIZE * config.head_dim
+            mask_base = chunk_base + 2 * DECODE_ATTN_CHUNK_SIZE * config.head_dim
+
+            packet[
+                k_base : k_base + DECODE_ATTN_CHUNK_SIZE * config.head_dim
+            ] = keys_cache[group_idx, chunk_start:chunk_end, :].reshape(-1)
+            packet[
+                v_base : v_base + DECODE_ATTN_CHUNK_SIZE * config.head_dim
+            ] = values_cache[group_idx, chunk_start:chunk_end, :].reshape(-1)
+
+            valid_in_chunk = max(
+                0, min(valid_tokens - chunk_start, DECODE_ATTN_CHUNK_SIZE)
+            )
+            if valid_in_chunk:
+                packet[mask_base : mask_base + valid_in_chunk] = 1.0
+
+        _, _, current_mask_offset = decode_packet_slot_offsets(
+            config, group_idx, current_slot
         )
-        cache_view[group_idx, dst_slot, :] = present[group_idx]
-        cache_bo.sync(sync_direction, sync_bytes, offset_elements * itemsize)
-    cache.device = "npu"
+        packet[current_mask_offset] = 1.0
+
+    packet_cache.to("npu")
+
+
+def sync_decode_packet_cache_slot(
+    config, packet_cache, present_key, present_value, dst_slot
+):
+    packet = packet_cache.data
+    for group_idx in range(config.n_kv_groups):
+        k_offset, v_offset, mask_offset = decode_packet_slot_offsets(
+            config, group_idx, dst_slot
+        )
+        packet[k_offset : k_offset + config.head_dim] = present_key[group_idx]
+        packet[v_offset : v_offset + config.head_dim] = present_value[group_idx]
+        packet[mask_offset] = 1.0
+
+        sync_decode_packet_range(packet_cache, k_offset, config.head_dim)
+        sync_decode_packet_range(packet_cache, v_offset, config.head_dim)
+        sync_decode_packet_range(packet_cache, mask_offset, 1)
 
 
 def append_decode_kv_cache(config, num_preceding_tokens):
@@ -1291,25 +1249,26 @@ def append_decode_kv_cache(config, num_preceding_tokens):
         return
 
     for layer_idx in range(config.n_layers):
-        for cache_name, present_name in (
-            ("keys_cache", "present_keys"),
-            ("values_cache", "present_values"),
-        ):
-            present = (
-                aie_ops.decode.fused.get_buffer(f"{present_name}_{layer_idx}")
-                .data
-                .reshape(config.n_kv_groups, config.head_dim)
-            )
-            cache = aie_ops.decode.fused.get_buffer(f"{cache_name}_{layer_idx}")
-            sync_decode_cache_slot(config, cache, present, dst_slot)
+        present_key = (
+            aie_ops.decode.fused.get_buffer(f"present_keys_{layer_idx}")
+            .data
+            .reshape(config.n_kv_groups, config.head_dim)
+        )
+        present_value = (
+            aie_ops.decode.fused.get_buffer(f"present_values_{layer_idx}")
+            .data
+            .reshape(config.n_kv_groups, config.head_dim)
+        )
+        packet_cache = aie_ops.decode.fused.get_buffer(f"packet_cache_{layer_idx}")
+        sync_decode_packet_cache_slot(
+            config, packet_cache, present_key, present_value, dst_slot
+        )
 
 
 def llama_forward_pass_decode(config, state):
     batch, seq_len = state.token_ids.shape
     assert seq_len == 1
     assert state.num_preceding_tokens < max_seq_len
-
-    update_decode_attention_mask(config, state.num_preceding_tokens)
 
     # Prefill RoPE angle look-up tables
     angles_slice = config.angles[
@@ -1330,11 +1289,15 @@ def llama_forward_pass_decode(config, state):
     aie_ops.decode.fused.input_buffer.to("cpu")
     aie_ops.decode.fused()  # FusedFullELFCallable.__call__() syncs output_buffer to cpu
     append_decode_kv_cache(config, state.num_preceding_tokens)
-    logits = (
-        aie_ops.decode.fused.get_buffer("logits")
+    hidden = (
+        aie_ops.decode.fused.get_buffer("hidden_out")
         .torch_view()
-        .view(1, 1, config.vocab_size)
+        .view(1, 1, config.emb_dim)
     )
+    logits = torch.nn.functional.linear(
+        hidden.float(),
+        config.weights["model.embed_tokens.weight"].float(),
+    ).to(torch.bfloat16)
 
     return logits, state
 
@@ -1349,19 +1312,15 @@ def llama_forward_pass(config, state):
     if seq_len > 1:
         ret = llama_forward_pass_prefill(config, state)
         state.num_preceding_tokens = state.token_ids.shape[1]
-        initialize_decode_attention_mask(config, state.num_preceding_tokens)
-        # Pass KV cache data onto fused decode operator
+        # Pack prefill KV state into the fused decode packet cache.
         for layer_idx in range(config.n_layers):
-            keys_cache = aie_ops.decode.fused.get_buffer(f"keys_cache_{layer_idx}")
-            values_cache = aie_ops.decode.fused.get_buffer(f"values_cache_{layer_idx}")
-            keys_cache.torch_view()[
-                :
-            ] = (aie_buffers.keys_cache[layer_idx].to_torch().flatten())
-            values_cache.torch_view()[
-                :
-            ] = (aie_buffers.values_cache[layer_idx].to_torch().flatten())
-            keys_cache.to("npu")
-            values_cache.to("npu")
+            initialize_decode_packet_cache(
+                config,
+                layer_idx,
+                aie_buffers.keys_cache[layer_idx].to_torch(),
+                aie_buffers.values_cache[layer_idx].to_torch(),
+                state.num_preceding_tokens,
+            )
         return ret
     else:
         ret = llama_forward_pass_decode(config, state)

@@ -12,3 +12,4 @@ from .softmax.op import Softmax
 from .transpose.op import Transpose
 from .strided_copy.op import StridedCopy
 from .repeat.op import Repeat
+from .llama_chunked_attention.op import LlamaChunkedAttention
