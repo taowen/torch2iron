@@ -160,6 +160,40 @@ def decode_buffer_name(node) -> str | None:
     return None
 
 
+def prefill_buffer_name(node) -> str | None:
+    if target_is(node, "aten.rms_norm.default") and path_endswith(
+        node, "input_layernorm"
+    ):
+        return "W_norm1"
+    if target_is(node, "aten.rms_norm.default") and path_endswith(
+        node, "post_attention_layernorm"
+    ):
+        return "W_norm2"
+    if target_is(node, "aten.linear.default") and path_endswith(
+        node, "self_attn.q_proj"
+    ):
+        return "W_attn_query_prefill"
+    if target_is(node, "aten.linear.default") and path_endswith(
+        node, "self_attn.k_proj"
+    ):
+        return "W_attn_key_prefill"
+    if target_is(node, "aten.linear.default") and path_endswith(
+        node, "self_attn.v_proj"
+    ):
+        return "W_attn_value_prefill"
+    if target_is(node, "aten.linear.default") and path_endswith(
+        node, "mlp.gate_proj"
+    ):
+        return "W_ffn_gate_prefill"
+    if target_is(node, "aten.linear.default") and path_endswith(node, "mlp.up_proj"):
+        return "W_ffn_up_prefill"
+    if target_is(node, "aten.linear.default") and path_endswith(
+        node, "mlp.down_proj"
+    ):
+        return "W_ffn_down_prefill"
+    return None
+
+
 def decode_transformer_weight_names(exported_program) -> list[str]:
     names = []
     for node in call_function_nodes(exported_program):
@@ -197,6 +231,10 @@ def decode_weight_source(exported_program, node) -> str | None:
     return _parameter_targets(exported_program)[parameter_node.name]
 
 
+def weight_source(exported_program, node) -> str | None:
+    return decode_weight_source(exported_program, node)
+
+
 def decode_weight_specs(exported_program) -> list[dict[str, object]]:
     specs = []
     for node in call_function_nodes(exported_program):
@@ -209,9 +247,31 @@ def decode_weight_specs(exported_program) -> list[dict[str, object]]:
                 "layer": layer_idx(node),
                 "group": group,
                 "name": name,
-                "source": decode_weight_source(exported_program, node),
+                "source": weight_source(exported_program, node),
             }
         )
+    return specs
+
+
+def prefill_layer_weight_specs(exported_program) -> list[dict[str, object]]:
+    specs = []
+    seen = set()
+    for node in representative_layer_nodes(exported_program):
+        name = prefill_buffer_name(node)
+        if name is None or name in seen:
+            continue
+        source = weight_source(exported_program, node)
+        layer = layer_idx(node)
+        if source is None or layer is None:
+            continue
+        specs.append(
+            {
+                "name": name,
+                "source_suffix": source.removeprefix(f"layers.{layer}."),
+                "transpose": target_is(node, "aten.linear.default"),
+            }
+        )
+        seen.add(name)
     return specs
 
 
@@ -267,12 +327,19 @@ def _jinja_env() -> Environment:
         decode_transformer_weight_names=decode_transformer_weight_names,
         decode_lm_head_weight_names=decode_lm_head_weight_names,
         decode_weight_specs=decode_weight_specs,
+        prefill_layer_weight_specs=prefill_layer_weight_specs,
     )
     return env
 
 
 def render_decode_layout(exported_program) -> str:
     return _jinja_env().get_template("decode_layout.py.j2").render(
+        exported_program=exported_program
+    )
+
+
+def render_prefill_layout(exported_program) -> str:
+    return _jinja_env().get_template("prefill_layout.py.j2").render(
         exported_program=exported_program
     )
 
@@ -290,13 +357,21 @@ def render_prefill_runtime(exported_program) -> str:
     )
 
 
+def render_prefill_operators(exported_program) -> str:
+    return _jinja_env().get_template("prefill_operators.py.j2").render(
+        exported_program=exported_program
+    )
+
+
 def render_generated_files() -> dict[str, str]:
     decode_program = export_decode_program_for_codegen()
     prefill_program = export_prefill_program_for_codegen()
     return {
         "decode_layout.py": render_decode_layout(decode_program),
+        "prefill_layout.py": render_prefill_layout(prefill_program),
         "decode_fused.py": render_decode_fused(decode_program),
         "prefill_runtime.py": render_prefill_runtime(prefill_program),
+        "prefill_operators.py": render_prefill_operators(prefill_program),
     }
 
 

@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generated prefill AIE operator builder for exported_llama3.
+
+Regenerate with:
+    uv run python -m models.exported_llama3.codegen
+
+This file is rendered directly from torch.export.ExportedProgram. The generated
+builder still uses runtime model dimensions because the export graph only tells
+us which operators are needed and in which model region they appear.
+"""
+
+from __future__ import annotations
+
+from torch2iron.operators import (
+    ElementwiseAdd,
+    ElementwiseMul,
+    GEMM,
+    RMSNorm,
+    RoPE,
+    SiLU,
+)
+
+
+PREFILL_NUM_AIE_COLUMNS = 8
+PREFILL_GEMM_TILE_SIZE = 64
+PREFILL_VOCAB_PARTITIONS = 4
+
+
+def _compile_callable(op):
+    return op.compile().get_callable()
+
+
+def _configure_prefill_vocab(config):
+    min_n = (
+        PREFILL_GEMM_TILE_SIZE
+        * PREFILL_NUM_AIE_COLUMNS
+        * PREFILL_VOCAB_PARTITIONS
+    )
+    config.padded_vocab_size = (config.vocab_size + min_n - 1) // min_n * min_n
+    config.vocab_partitions = PREFILL_VOCAB_PARTITIONS
+
+
+def _prefill_gemm(
+    config, prompt_len, context, *, k, n, b_col_maj=False, separate_c_tiles=False
+):
+    return GEMM(
+        M=prompt_len,
+        K=k,
+        N=n,
+        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+        tile_m=PREFILL_GEMM_TILE_SIZE,
+        tile_k=PREFILL_GEMM_TILE_SIZE,
+        tile_n=PREFILL_GEMM_TILE_SIZE,
+        b_col_maj=b_col_maj,
+        separate_c_tiles=separate_c_tiles,
+        context=context,
+    )
+
+
+def build_prefill_operations(prefill, config, prompt_len, context):
+    _configure_prefill_vocab(config)
+    emb_size = prompt_len * config.emb_dim
+    hidden_size = prompt_len * config.hidden_dim
+    kv_dim = config.n_kv_groups * config.head_dim
+
+    prefill.rms_norm = _compile_callable(
+        RMSNorm(
+            size=emb_size,
+            num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+            num_channels=1,
+            tile_size=config.emb_dim,
+            weighted=True,
+            context=context,
+        )
+    )
+
+    prefill.attn_query = _compile_callable(
+        _prefill_gemm(
+            config,
+            prompt_len,
+            context,
+            k=config.emb_dim,
+            n=config.n_heads * config.head_dim,
+        )
+    )
+
+    prefill.attn_key = _compile_callable(
+        _prefill_gemm(config, prompt_len, context, k=config.emb_dim, n=kv_dim)
+    )
+
+    prefill.attn_value = _compile_callable(
+        _prefill_gemm(config, prompt_len, context, k=config.emb_dim, n=kv_dim)
+    )
+
+    prefill.rope_queries = _compile_callable(
+        RoPE(
+            rows=prompt_len * config.n_heads,
+            cols=config.head_dim,
+            angle_rows=prompt_len,
+            context=context,
+        )
+    )
+
+    prefill.rope_keys = _compile_callable(
+        RoPE(
+            rows=prompt_len * config.n_kv_groups,
+            cols=config.head_dim,
+            angle_rows=prompt_len,
+            context=context,
+        )
+    )
+
+    prefill.attn_scores = _compile_callable(
+        _prefill_gemm(config, prompt_len, context, k=config.head_dim, n=prompt_len)
+    )
+
+    prefill.attn_scale = _compile_callable(
+        ElementwiseMul(
+            size=config.n_heads * prompt_len * prompt_len,
+            tile_size=prompt_len,
+            num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+            context=context,
+        )
+    )
+
+    prefill.residual_add = _compile_callable(
+        ElementwiseAdd(
+            size=emb_size,
+            tile_size=config.emb_dim,
+            context=context,
+        )
+    )
+
+    prefill.ffn_up_gate = _compile_callable(
+        _prefill_gemm(config, prompt_len, context, k=config.emb_dim, n=config.hidden_dim)
+    )
+
+    prefill.ffn_silu = _compile_callable(
+        SiLU(
+            size=hidden_size,
+            tile_size=config.hidden_dim,
+            num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+            context=context,
+        )
+    )
+    prefill.eltwise_mul_ffn = _compile_callable(
+        ElementwiseMul(
+            size=hidden_size,
+            tile_size=config.hidden_dim,
+            num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+            context=context,
+        )
+    )
+
+    prefill.ffn_down = _compile_callable(
+        _prefill_gemm(config, prompt_len, context, k=config.hidden_dim, n=config.emb_dim)
+    )
+
+    prefill.gemv_out_head_compilable = _prefill_gemm(
+        config,
+        prompt_len,
+        context,
+        k=config.emb_dim,
+        n=config.padded_vocab_size // config.vocab_partitions,
+        b_col_maj=True,
+        separate_c_tiles=True,
+    ).compile()
+    prefill.out_head = prefill.gemv_out_head_compilable.get_callable()
+
