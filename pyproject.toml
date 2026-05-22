@@ -1,0 +1,18 @@
+[project]
+name = "torch2iron"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "ml-dtypes",
+    "safetensors",
+    "tiktoken",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
