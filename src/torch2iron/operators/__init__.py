@@ -13,3 +13,4 @@ from .transpose.op import Transpose
 from .strided_copy.op import StridedCopy
 from .repeat.op import Repeat
 from .llama_chunked_attention.op import LlamaChunkedAttention
+from .llama_chunked_prefill_attention.op import LlamaChunkedPrefillAttention

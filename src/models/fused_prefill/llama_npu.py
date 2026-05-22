@@ -18,13 +18,15 @@ from models.fused_prefill.aie_buffers import AIELlamaBuffers
 from models.fused_prefill.aie_operators import AIELlamaOperators
 from models.fused_prefill.decode_packet_cache import (
     append_decode_kv_cache,
-    initialize_decode_packet_cache,
+    decode_packet_slot_offsets,
+    sync_decode_packet_range,
 )
+from models.fused_prefill.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
 from models.fused_prefill.llama_packed_weights import (
     default_llama_packed_weights_dir,
     write_llama_packed_weight_artifact,
 )
-from models.fused_prefill.generated.prefill_runtime import prefill_forward_pass
+from models.fused_prefill.fused_prefill_runtime import fused_prefill_forward_pass
 from models.fused_prefill.runtime_config import select_compiled_seq_len
 import logging
 
@@ -51,23 +53,30 @@ class LlamaNpuRunner:
         return ret
 
     def prefill(self, state):
-        return prefill_forward_pass(self, state)
+        return fused_prefill_forward_pass(self, state)
 
     def decode(self, state):
         return _decode_forward_pass(self, self.config, state)
 
     def sync_prefill_cache_to_decode(self, state):
-        # Pack prefill KV state into the fused decode packet cache.
+        # Prefill and decode share the packet cache BO. Mark decode's fixed
+        # scratch slot as valid for the current token; no full cache copy is
+        # needed at the prefill/decode boundary.
+        current_slot = self.aie_ops.decode.current_cache_slot
         for layer_idx in range(self.config.n_layers):
-            initialize_decode_packet_cache(
-                self.config,
-                self.aie_ops,
-                self.max_seq_len,
-                layer_idx,
-                self.aie_buffers.keys_cache[layer_idx].to_torch(),
-                self.aie_buffers.values_cache[layer_idx].to_torch(),
-                state.num_preceding_tokens,
+            packet_cache = self.aie_ops.decode.fused.get_buffer(
+                DECODE_PACKET_CACHE_NAMES[layer_idx]
             )
+            packet = packet_cache.torch_view()
+            for group_idx in range(self.config.n_kv_groups):
+                _, _, mask_offset = decode_packet_slot_offsets(
+                    self.config,
+                    self.max_seq_len,
+                    group_idx,
+                    current_slot,
+                )
+                packet[mask_offset] = 1.0
+                sync_decode_packet_range(packet_cache, mask_offset, 1)
 
 
 # Decode

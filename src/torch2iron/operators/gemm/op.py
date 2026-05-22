@@ -31,13 +31,13 @@ class GEMM(MLIROperator):
     b_col_maj: bool = False
     c_col_maj: bool = False
     num_aie_columns: int = field(default=8)
-    emulate_bf16_mmul_with_bfp16: bool = field(default=True, repr=False)
-    prio_accuracy: bool = field(default=False, repr=False)
-    round_conv_even: bool = field(default=True, repr=False)
-    dtype_in: str = field(default="bf16", repr=False)
-    dtype_out: str = field(default="bf16", repr=False)
-    use_scalar: bool = field(default=False, repr=False)
-    separate_c_tiles: bool = field(default=False, repr=False)
+    emulate_bf16_mmul_with_bfp16: bool = True
+    prio_accuracy: bool = False
+    round_conv_even: bool = True
+    dtype_in: str = "bf16"
+    dtype_out: str = "bf16"
+    use_scalar: bool = False
+    separate_c_tiles: bool = False
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -47,6 +47,13 @@ class GEMM(MLIROperator):
         "tile_n": "tn",
         "b_col_maj": "bc",
         "c_col_maj": "cc",
+        "emulate_bf16_mmul_with_bfp16": "emu",
+        "prio_accuracy": "acc",
+        "round_conv_even": "rc",
+        "dtype_in": "di",
+        "dtype_out": "do",
+        "use_scalar": "scalar",
+        "separate_c_tiles": "sep",
     }
 
     def __post_init__(self):

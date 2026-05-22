@@ -3,15 +3,12 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hand-written fused prefill prototype.
+"""Chunked fused prefill prototype.
 
-The upstream IRON Llama path only fuses decode. Prefill is still a Python
-sequence of AIE dispatches with CPU attention in the middle. This module starts
-the replacement path: build one FusedMLIROperator for the full static prefill
-graph, including per-layer full-sequence attention.
-
-This is intentionally hand-owned in ``models.fused_prefill`` and is not emitted
-by ``codegen.py``.
+This is intentionally hand-owned in ``models.fused_prefill`` while the shape of
+the optimized prefill path is still evolving.  The design mirrors the decode ELF
+path: one fused transformer dispatch per chunk, decode-style packet KV caches,
+and a streaming attention kernel instead of materialized full-sequence scores.
 """
 
 from __future__ import annotations
@@ -24,28 +21,34 @@ from torch2iron.operators import (
     ElementwiseAdd,
     ElementwiseMul,
     GEMM,
+    LlamaChunkedPrefillAttention,
     RMSNorm,
     RoPE,
     SiLU,
-    Softmax,
     StridedCopy,
+)
+
+from models.fused_prefill.generated.decode_layout import (
+    DECODE_PACKET_CACHE_NAMES,
+    EXPECTED_DECODE_LAYERS,
+)
+from models.fused_prefill.runtime_config import (
+    DECODE_ATTN_CHUNK_SIZE,
+    PREFILL_CHUNK_COMPUTE_ROWS,
+    PREFILL_CHUNK_SIZE,
+    PREFILL_LM_HEAD_ROWS,
 )
 
 
 BF16_BYTES = 2
 PREFILL_NUM_AIE_COLUMNS = 8
 PREFILL_GEMM_TILE_SIZE = 64
+PREFILL_CHUNK_GEMM_TILE_M = 8
 PREFILL_VOCAB_PARTITIONS = 4
 
 
 def _bytes(elements: int) -> int:
     return elements * BF16_BYTES
-
-
-def _slice(name: str, start_elements: int, length_elements: int) -> str:
-    start = _bytes(start_elements)
-    end = _bytes(start_elements + length_elements)
-    return f"{name}[{start}:{end}]"
 
 
 def _configure_prefill_vocab(config) -> None:
@@ -60,25 +63,25 @@ def _configure_prefill_vocab(config) -> None:
 
 def _prefill_gemm(
     config,
-    prompt_len,
+    query_len,
     context,
     *,
     k,
     n,
-    num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
     b_col_maj=False,
     separate_c_tiles=False,
 ):
     return GEMM(
-        M=prompt_len,
+        M=query_len,
         K=k,
         N=n,
-        num_aie_columns=num_aie_columns,
-        tile_m=PREFILL_GEMM_TILE_SIZE,
+        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+        tile_m=PREFILL_CHUNK_GEMM_TILE_M,
         tile_k=PREFILL_GEMM_TILE_SIZE,
         tile_n=PREFILL_GEMM_TILE_SIZE,
         b_col_maj=b_col_maj,
         separate_c_tiles=separate_c_tiles,
+        emulate_bf16_mmul_with_bfp16=False,
         context=context,
     )
 
@@ -88,8 +91,10 @@ def _strided_copy(
     *,
     input_sizes,
     input_strides,
+    input_offset=0,
     output_sizes,
     output_strides,
+    output_offset=0,
     input_buffer_size,
     output_buffer_size,
     num_aie_channels=1,
@@ -97,19 +102,15 @@ def _strided_copy(
     return StridedCopy(
         input_sizes=input_sizes,
         input_strides=input_strides,
-        input_offset=0,
+        input_offset=input_offset,
         output_sizes=output_sizes,
         output_strides=output_strides,
-        output_offset=0,
+        output_offset=output_offset,
         input_buffer_size=input_buffer_size,
         output_buffer_size=output_buffer_size,
         num_aie_channels=num_aie_channels,
         context=context,
     )
-
-
-def _lm_head_part_name(part_idx: int) -> str:
-    return f"W_out_head_part_{part_idx}"
 
 
 def _layer_weight_names(config) -> list[str]:
@@ -118,14 +119,14 @@ def _layer_weight_names(config) -> list[str]:
         names.extend(
             [
                 f"W_norm1_{layer_idx}",
-                f"W_attn_query_{layer_idx}",
-                f"W_attn_key_{layer_idx}",
-                f"W_attn_value_{layer_idx}",
-                f"W_attn_output_{layer_idx}",
+                f"W_attn_query_prefill_{layer_idx}",
+                f"W_attn_key_prefill_{layer_idx}",
+                f"W_attn_value_prefill_{layer_idx}",
+                f"W_attn_output_prefill_{layer_idx}",
                 f"W_norm2_{layer_idx}",
-                f"W_ffn_gate_{layer_idx}",
-                f"W_ffn_up_{layer_idx}",
-                f"W_ffn_down_{layer_idx}",
+                f"W_ffn_gate_prefill_{layer_idx}",
+                f"W_ffn_up_prefill_{layer_idx}",
+                f"W_ffn_down_prefill_{layer_idx}",
             ]
         )
     names.append("W_final_norm")
@@ -140,27 +141,49 @@ def _present_value_name(layer_idx: int) -> str:
     return f"present_values_{layer_idx}"
 
 
-def build_prefill_fused_op(config, prompt_len, build_suffix):
+def build_prefill_fused_op(config, max_seq_len, build_suffix, dry_run=False):
     _configure_prefill_vocab(config)
-
+    if config.n_layers != EXPECTED_DECODE_LAYERS:
+        raise ValueError(
+            f"chunked prefill expects {EXPECTED_DECODE_LAYERS} layers, "
+            f"got {config.n_layers}"
+        )
     context = AIEContext(build_dir=Path("build_prefill_elf") / build_suffix)
+    query_len = PREFILL_CHUNK_SIZE
+    compute_rows = PREFILL_CHUNK_COMPUTE_ROWS
+    if compute_rows < query_len:
+        raise ValueError("PREFILL_CHUNK_COMPUTE_ROWS must cover PREFILL_CHUNK_SIZE")
     emb_dim = config.emb_dim
     hidden_dim = config.hidden_dim
     n_heads = config.n_heads
     n_kv_groups = config.n_kv_groups
     q_heads_per_group = n_heads // n_kv_groups
+    q_head_block_size = q_heads_per_group
+    if q_heads_per_group % q_head_block_size != 0:
+        raise ValueError("q_heads_per_group must be divisible by q_head_block_size")
+    q_head_blocks_per_group = q_heads_per_group // q_head_block_size
+    logical_groups = n_kv_groups * q_head_blocks_per_group
     head_dim = config.head_dim
+    kv_dim = n_kv_groups * head_dim
 
-    x_elements = prompt_len * emb_dim
-    q_elements = prompt_len * n_heads * head_dim
-    kv_elements = prompt_len * n_kv_groups * head_dim
-    scores_elements = n_heads * prompt_len * prompt_len
-    head_q_elements = prompt_len * head_dim
-    head_score_elements = prompt_len * prompt_len
-    kv_group_elements = prompt_len * head_dim
-    logits_elements = prompt_len * config.padded_vocab_size
-    logits_part_width = config.padded_vocab_size // config.vocab_partitions
-    logits_part_elements = prompt_len * logits_part_width
+    x_elements = compute_rows * emb_dim
+    q_elements = compute_rows * n_heads * head_dim
+    kv_elements = compute_rows * kv_dim
+    q_attn_elements = query_len * n_heads * head_dim
+    kv_attn_elements = query_len * kv_dim
+    q_elements_per_group = query_len * q_head_block_size * head_dim
+    current_kv_elements_per_group = query_len * head_dim
+    q_current_elements_per_group = (
+        q_elements_per_group + 2 * current_kv_elements_per_group
+    )
+    q_current_elements = logical_groups * q_current_elements_per_group
+    packet_chunk_elements = (
+        2 * DECODE_ATTN_CHUNK_SIZE * head_dim + DECODE_ATTN_CHUNK_SIZE
+    )
+    packet_elements_per_group = (
+        max_seq_len // DECODE_ATTN_CHUNK_SIZE * packet_chunk_elements
+    )
+    packet_elements = n_kv_groups * packet_elements_per_group
 
     rms_norm_op = RMSNorm(
         size=x_elements,
@@ -176,269 +199,245 @@ def build_prefill_fused_op(config, prompt_len, build_suffix):
         context=context,
     )
     attn_query_op = _prefill_gemm(
-        config, prompt_len, context, k=emb_dim, n=n_heads * head_dim
+        config, compute_rows, context, k=emb_dim, n=n_heads * head_dim
     )
     attn_key_value_op = _prefill_gemm(
-        config, prompt_len, context, k=emb_dim, n=n_kv_groups * head_dim
+        config, compute_rows, context, k=emb_dim, n=kv_dim
     )
     rope_queries_op = RoPE(
-        rows=prompt_len * n_heads,
+        rows=compute_rows * n_heads,
         cols=head_dim,
-        angle_rows=prompt_len,
+        angle_rows=compute_rows,
         context=context,
     )
     rope_keys_op = RoPE(
-        rows=prompt_len * n_kv_groups,
+        rows=compute_rows * n_kv_groups,
         cols=head_dim,
-        angle_rows=prompt_len,
+        angle_rows=compute_rows,
         context=context,
     )
-
-    query_layout_op = _strided_copy(
+    pack_queries_op = _strided_copy(
         context,
-        input_sizes=(n_heads, prompt_len, head_dim),
-        input_strides=(head_dim, n_heads * head_dim, 1),
-        output_sizes=(n_heads, prompt_len, head_dim),
-        output_strides=(prompt_len * head_dim, head_dim, 1),
-        input_buffer_size=q_elements,
-        output_buffer_size=q_elements,
-        num_aie_channels=1,
-    )
-    key_scores_layout_op = _strided_copy(
-        context,
-        input_sizes=(n_kv_groups, head_dim, prompt_len),
-        input_strides=(head_dim, 1, n_kv_groups * head_dim),
-        output_sizes=(n_kv_groups, head_dim, prompt_len),
-        output_strides=(head_dim * prompt_len, prompt_len, 1),
-        input_buffer_size=kv_elements,
-        output_buffer_size=kv_elements,
-        num_aie_channels=1,
-    )
-    key_cache_layout_op = _strided_copy(
-        context,
-        input_sizes=(n_kv_groups, prompt_len, head_dim),
-        input_strides=(head_dim, n_kv_groups * head_dim, 1),
-        output_sizes=(n_kv_groups, prompt_len, head_dim),
-        output_strides=(prompt_len * head_dim, head_dim, 1),
-        input_buffer_size=kv_elements,
-        output_buffer_size=kv_elements,
-        num_aie_channels=1,
-    )
-    value_cache_layout_op = key_cache_layout_op
-    value_repeat_layout_op = _strided_copy(
-        context,
-        input_sizes=(n_kv_groups, q_heads_per_group, prompt_len, head_dim),
-        input_strides=(head_dim, 0, n_kv_groups * head_dim, 1),
-        output_sizes=(n_kv_groups, q_heads_per_group, prompt_len, head_dim),
+        input_sizes=(logical_groups, query_len, q_head_block_size, head_dim),
+        input_strides=(q_head_block_size * head_dim, n_heads * head_dim, head_dim, 1),
+        output_sizes=(logical_groups, query_len, q_head_block_size, head_dim),
         output_strides=(
-            q_heads_per_group * prompt_len * head_dim,
-            prompt_len * head_dim,
+            q_current_elements_per_group,
+            q_head_block_size * head_dim,
             head_dim,
             1,
         ),
-        input_buffer_size=kv_elements,
-        output_buffer_size=q_elements,
-        num_aie_channels=1,
-    )
-
-    attn_scores_op = _prefill_gemm(
-        config, prompt_len, context, k=head_dim, n=prompt_len
-    )
-    attn_scale_op = ElementwiseMul(
-        size=scores_elements,
-        tile_size=prompt_len,
-        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
-        context=context,
-    )
-    attn_mask_add_op = ElementwiseAdd(
-        size=scores_elements,
-        tile_size=prompt_len,
-        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
-        context=context,
-    )
-    softmax_op = Softmax(
-        rows=n_heads * prompt_len,
-        cols=prompt_len,
-        num_aie_columns=1,
-        num_channels=1,
-        rtp_vector_size=prompt_len,
-        context=context,
-    )
-    attn_context_op = _prefill_gemm(
-        config,
-        prompt_len,
-        context,
-        k=prompt_len,
-        n=head_dim,
-        num_aie_columns=1,
-    )
-    context_layout_op = _strided_copy(
-        context,
-        input_sizes=(prompt_len, n_heads, head_dim),
-        input_strides=(head_dim, prompt_len * head_dim, 1),
-        output_sizes=(prompt_len, n_heads, head_dim),
-        output_strides=(n_heads * head_dim, head_dim, 1),
         input_buffer_size=q_elements,
-        output_buffer_size=q_elements,
-        num_aie_channels=1,
+        output_buffer_size=q_current_elements,
     )
-    attn_output_op = _prefill_gemm(config, prompt_len, context, k=emb_dim, n=emb_dim)
-
-    ffn_up_gate_op = _prefill_gemm(config, prompt_len, context, k=emb_dim, n=hidden_dim)
+    pack_keys_op = _strided_copy(
+        context,
+        input_sizes=(n_kv_groups, q_head_blocks_per_group, query_len, head_dim),
+        input_strides=(head_dim, 0, kv_dim, 1),
+        output_sizes=(n_kv_groups, q_head_blocks_per_group, query_len, head_dim),
+        output_strides=(
+            q_head_blocks_per_group * q_current_elements_per_group,
+            q_current_elements_per_group,
+            head_dim,
+            1,
+        ),
+        output_offset=q_elements_per_group,
+        input_buffer_size=kv_elements,
+        output_buffer_size=q_current_elements,
+    )
+    pack_values_op = _strided_copy(
+        context,
+        input_sizes=(n_kv_groups, q_head_blocks_per_group, query_len, head_dim),
+        input_strides=(head_dim, 0, kv_dim, 1),
+        output_sizes=(n_kv_groups, q_head_blocks_per_group, query_len, head_dim),
+        output_strides=(
+            q_head_blocks_per_group * q_current_elements_per_group,
+            q_current_elements_per_group,
+            head_dim,
+            1,
+        ),
+        output_offset=q_elements_per_group + current_kv_elements_per_group,
+        input_buffer_size=kv_elements,
+        output_buffer_size=q_current_elements,
+    )
+    present_kv_copy_op = _strided_copy(
+        context,
+        input_sizes=(n_kv_groups, query_len, head_dim),
+        input_strides=(head_dim, kv_dim, 1),
+        output_sizes=(n_kv_groups, query_len, head_dim),
+        output_strides=(query_len * head_dim, head_dim, 1),
+        input_buffer_size=kv_elements,
+        output_buffer_size=kv_attn_elements,
+    )
+    llama_chunked_prefill_attention_op = LlamaChunkedPrefillAttention(
+        max_seq_len=max_seq_len,
+        query_len=query_len,
+        num_kv_groups=n_kv_groups,
+        q_heads_per_group=q_heads_per_group,
+        q_head_block_size=q_head_block_size,
+        head_dim=head_dim,
+        chunk_size=DECODE_ATTN_CHUNK_SIZE,
+        context=context,
+    )
+    unpack_context_op = _strided_copy(
+        context,
+        input_sizes=(logical_groups, query_len, q_head_block_size, head_dim),
+        input_strides=(
+            q_elements_per_group,
+            q_head_block_size * head_dim,
+            head_dim,
+            1,
+        ),
+        output_sizes=(logical_groups, query_len, q_head_block_size, head_dim),
+        output_strides=(
+            q_head_block_size * head_dim,
+            n_heads * head_dim,
+            head_dim,
+            1,
+        ),
+        input_buffer_size=q_attn_elements,
+        output_buffer_size=q_elements,
+    )
+    attn_output_op = _prefill_gemm(
+        config, compute_rows, context, k=n_heads * head_dim, n=emb_dim
+    )
+    ffn_up_gate_op = _prefill_gemm(config, compute_rows, context, k=emb_dim, n=hidden_dim)
     ffn_silu_op = SiLU(
-        size=prompt_len * hidden_dim,
+        size=compute_rows * hidden_dim,
         tile_size=hidden_dim,
         num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
         context=context,
     )
     ffn_mul_op = ElementwiseMul(
-        size=prompt_len * hidden_dim,
+        size=compute_rows * hidden_dim,
         tile_size=hidden_dim,
         num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
         context=context,
     )
-    ffn_down_op = _prefill_gemm(config, prompt_len, context, k=hidden_dim, n=emb_dim)
-    lm_head_op = _prefill_gemm(
-        config,
-        prompt_len,
-        context,
-        k=emb_dim,
-        n=logits_part_width,
-        b_col_maj=True,
-        separate_c_tiles=True,
-    )
+    ffn_down_op = _prefill_gemm(config, compute_rows, context, k=hidden_dim, n=emb_dim)
 
     runlist = []
     for layer_idx in range(config.n_layers):
         runlist.extend(
             [
                 (rms_norm_op, "x", f"W_norm1_{layer_idx}", "x_norm"),
-                (attn_query_op, "x_norm", f"W_attn_query_{layer_idx}", "queries_raw"),
-                (attn_key_value_op, "x_norm", f"W_attn_key_{layer_idx}", "keys_raw"),
+                (
+                    attn_query_op,
+                    "x_norm",
+                    f"W_attn_query_prefill_{layer_idx}",
+                    "queries",
+                ),
                 (
                     attn_key_value_op,
                     "x_norm",
-                    f"W_attn_value_{layer_idx}",
-                    "values_raw",
+                    f"W_attn_key_prefill_{layer_idx}",
+                    "keys",
                 ),
-                (rope_queries_op, "queries_raw", "rope_angles", "queries_raw"),
-                (rope_keys_op, "keys_raw", "rope_angles", "keys_raw"),
-                (query_layout_op, "queries_raw", "queries"),
-                (key_scores_layout_op, "keys_raw", "keys_for_scores"),
-                (key_cache_layout_op, "keys_raw", _present_key_name(layer_idx)),
-                (value_cache_layout_op, "values_raw", _present_value_name(layer_idx)),
-                (value_repeat_layout_op, "values_raw", "values"),
-            ]
-        )
-
-        for head_idx in range(n_heads):
-            kv_group = head_idx // q_heads_per_group
-            runlist.append(
                 (
-                    attn_scores_op,
-                    _slice("queries", head_idx * head_q_elements, head_q_elements),
-                    _slice(
-                        "keys_for_scores",
-                        kv_group * head_q_elements,
-                        head_q_elements,
-                    ),
-                    _slice(
-                        "attn_scores",
-                        head_idx * head_score_elements,
-                        head_score_elements,
-                    ),
-                )
-            )
-
-        runlist.extend(
-            [
-                (attn_scale_op, "attn_scores", "attn_scale_factor", "attn_scores"),
-                (attn_mask_add_op, "attn_scores", "attn_mask", "attn_scores"),
-                (softmax_op, "attn_scores", "attn_weights"),
-            ]
-        )
-
-        for head_idx in range(n_heads):
-            kv_group = head_idx // q_heads_per_group
-            runlist.append(
+                    attn_key_value_op,
+                    "x_norm",
+                    f"W_attn_value_prefill_{layer_idx}",
+                    "values",
+                ),
+                (rope_queries_op, "queries", "rope_angles", "queries"),
+                (rope_keys_op, "keys", "rope_angles", "keys"),
+                (pack_queries_op, "queries", "qkv_current"),
+                (pack_keys_op, "keys", "qkv_current"),
+                (pack_values_op, "values", "qkv_current"),
+                (present_kv_copy_op, "keys", _present_key_name(layer_idx)),
+                (present_kv_copy_op, "values", _present_value_name(layer_idx)),
                 (
-                    attn_context_op,
-                    _slice(
-                        "attn_weights",
-                        head_idx * head_score_elements,
-                        head_score_elements,
-                    ),
-                    _slice("values", kv_group * head_q_elements, head_q_elements),
-                    _slice(
-                        "attn_context_heads",
-                        head_idx * head_q_elements,
-                        head_q_elements,
-                    ),
-                )
-            )
-
-        runlist.extend(
-            [
-                (context_layout_op, "attn_context_heads", "attn_context"),
+                    llama_chunked_prefill_attention_op,
+                    "qkv_current",
+                    DECODE_PACKET_CACHE_NAMES[layer_idx],
+                    "attn_context_grouped",
+                ),
+                (unpack_context_op, "attn_context_grouped", "attn_context"),
                 (
                     attn_output_op,
                     "attn_context",
-                    f"W_attn_output_{layer_idx}",
+                    f"W_attn_output_prefill_{layer_idx}",
                     "attn_output",
                 ),
                 (residual_add_op, "x", "attn_output", "x"),
                 (rms_norm_op, "x", f"W_norm2_{layer_idx}", "x_norm"),
-                (ffn_up_gate_op, "x_norm", f"W_ffn_gate_{layer_idx}", "ffn_gate"),
-                (ffn_up_gate_op, "x_norm", f"W_ffn_up_{layer_idx}", "ffn_up"),
+                (ffn_up_gate_op, "x_norm", f"W_ffn_gate_prefill_{layer_idx}", "ffn_gate"),
+                (ffn_up_gate_op, "x_norm", f"W_ffn_up_prefill_{layer_idx}", "ffn_up"),
                 (ffn_silu_op, "ffn_gate", "ffn_gate"),
                 (ffn_mul_op, "ffn_gate", "ffn_up", "ffn_hidden"),
-                (ffn_down_op, "ffn_hidden", f"W_ffn_down_{layer_idx}", "ffn_output"),
+                (
+                    ffn_down_op,
+                    "ffn_hidden",
+                    f"W_ffn_down_prefill_{layer_idx}",
+                    "ffn_output",
+                ),
                 (residual_add_op, "x", "ffn_output", "x"),
             ]
         )
 
     runlist.append((rms_norm_op, "x", "W_final_norm", "hidden_out"))
-    for part_idx in range(config.vocab_partitions):
-        runlist.append(
-            (
-                lm_head_op,
-                "hidden_out",
-                _lm_head_part_name(part_idx),
-                _slice(
-                    "logits",
-                    part_idx * logits_part_elements,
-                    logits_part_elements,
-                ),
-            )
-        )
 
     output_args = [
-        "logits",
+        "hidden_out",
         *[_present_key_name(i) for i in range(config.n_layers)],
         *[_present_value_name(i) for i in range(config.n_layers)],
     ]
 
     return FusedMLIROperator(
-        "prefill_fused_op",
+        "prefill_chunk_fused_op",
         runlist,
-        input_args=["x", "rope_angles", "attn_mask"],
+        input_args=["x", "rope_angles"],
         output_args=output_args,
         buffer_sizes={
-            "logits": _bytes(logits_elements),
+            "qkv_current": _bytes(q_current_elements),
+            "hidden_out": _bytes(x_elements),
             **{
-                _present_key_name(i): _bytes(kv_elements)
-                for i in range(config.n_layers)
-            },
-            **{
-                _present_value_name(i): _bytes(kv_elements)
-                for i in range(config.n_layers)
+                name: _bytes(packet_elements)
+                for name in DECODE_PACKET_CACHE_NAMES
             },
         },
         external_args={
             "weight": _layer_weight_names(config),
-            "lm_head": [
-                _lm_head_part_name(i) for i in range(config.vocab_partitions)
-            ],
+            "kv_cache": list(DECODE_PACKET_CACHE_NAMES),
         },
+        compile_mode="full_elf_dynamic",
         context=context,
-    ).compile()
+    ).compile(dry_run=dry_run)
+
+
+def build_prefill_lm_head_fused_op(config, build_suffix, dry_run=False):
+    _configure_prefill_vocab(config)
+    context = AIEContext(build_dir=Path("build_prefill_elf") / f"{build_suffix}_lm_head")
+    partition_width = config.padded_vocab_size // config.vocab_partitions
+    lm_head_op = GEMM(
+        M=PREFILL_LM_HEAD_ROWS,
+        K=config.emb_dim,
+        N=partition_width,
+        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+        tile_m=PREFILL_LM_HEAD_ROWS // 4,
+        tile_k=PREFILL_GEMM_TILE_SIZE,
+        tile_n=PREFILL_GEMM_TILE_SIZE,
+        b_col_maj=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=context,
+    )
+    lm_head_weight_names = [
+        f"W_out_head_part_{part_idx}" for part_idx in range(config.vocab_partitions)
+    ]
+    lm_head_output_names = [
+        f"logits_part_{part_idx}" for part_idx in range(config.vocab_partitions)
+    ]
+    return FusedMLIROperator(
+        "prefill_lm_head_fused_op",
+        [
+            (lm_head_op, "x", weight_name, output_name)
+            for weight_name, output_name in zip(
+                lm_head_weight_names, lm_head_output_names
+            )
+        ],
+        input_args=["x"],
+        output_args=lm_head_output_names,
+        external_args={"lm_head": lm_head_weight_names},
+        compile_mode="full_elf_dynamic",
+        context=context,
+    ).compile(dry_run=dry_run)

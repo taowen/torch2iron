@@ -10,14 +10,15 @@ from iron.common.context import AIEContext
 from torch2iron.fusion import FusedFullELFCallable
 
 from models.fused_prefill.generated.decode_fused import build_decode_fused_op
-from models.fused_prefill.generated.prefill_operators import (
-    build_prefill_operations,
-)
 from models.fused_prefill.llama_packed_weights import (
     load_llama_packed_segment,
     validate_llama_packed_weight_artifact,
 )
 from models.fused_prefill.llama_weight_layout import iter_llama_decode_weight_specs
+from models.fused_prefill.prefill_fused import (
+    build_prefill_fused_op,
+    build_prefill_lm_head_fused_op,
+)
 
 
 class AIEPrefillOperations:
@@ -41,13 +42,32 @@ class AIELlamaOperators:
         self._build_decode_ops(config, prompt_len, build_suffix)
 
     def _build_prefill_ops(self, config, prompt_len):
-        build_prefill_operations(self.prefill, config, prompt_len, self.context)
+        self.prefill.fused_op = build_prefill_fused_op(
+            config, prompt_len, f"seq{prompt_len}"
+        )
+        self.prefill.fused = self.prefill.fused_op.get_callable()
+
+        self.prefill.lm_head_op = build_prefill_lm_head_fused_op(
+            config, f"seq{prompt_len}"
+        )
+        self.prefill.lm_head = self.prefill.lm_head_op.get_callable()
+
+        load_prefill_fused_weight_buffers(config, self.prefill.fused)
+        self.prefill.fused.weight_buffer.to("npu")
+        self.prefill.fused.scratch_buffer.to("npu")
+        self.prefill.fused.output_buffer.to("npu")
+        load_prefill_lm_head_weight_buffer(config, self.prefill.lm_head)
+        self.prefill.lm_head.lm_head_buffer.to("npu")
 
     def _build_decode_ops(self, config, prompt_len, build_suffix):
         self.decode.fused_op, self.decode.current_cache_slot = build_decode_fused_op(
             config, prompt_len, build_suffix
         )
         self.decode.fused = FusedFullELFCallable(self.decode.fused_op)
+        self.decode.fused.replace_buffer(
+            "kv_cache",
+            self.prefill.fused.kv_cache_buffer,
+        )
 
         load_decode_weight_buffers(config, self.decode.fused)
         self.decode.fused.input_buffer.to("npu")
@@ -77,3 +97,78 @@ def load_decode_weight_buffers(config, fused):
             view[:] = load_llama_packed_segment(
                 packed_dir, manifest, spec["name"]
             ).flatten()
+
+
+def _copy_buffer(fused, name, tensor):
+    fused.get_buffer(name).torch_view()[:] = tensor.flatten()
+
+
+def _copy_transposed_buffer(fused, name, tensor):
+    fused.get_buffer(name).torch_view()[:] = tensor.T.contiguous().flatten()
+
+
+def load_prefill_fused_weight_buffers(config, fused):
+    for layer_idx in range(config.n_layers):
+        prefix = f"model.layers.{layer_idx}"
+        _copy_buffer(
+            fused,
+            f"W_norm1_{layer_idx}",
+            config.weights[f"{prefix}.input_layernorm.weight"],
+        )
+        _copy_transposed_buffer(
+            fused,
+            f"W_attn_query_prefill_{layer_idx}",
+            config.weights[f"{prefix}.self_attn.q_proj.weight"],
+        )
+        _copy_transposed_buffer(
+            fused,
+            f"W_attn_key_prefill_{layer_idx}",
+            config.weights[f"{prefix}.self_attn.k_proj.weight"],
+        )
+        _copy_transposed_buffer(
+            fused,
+            f"W_attn_value_prefill_{layer_idx}",
+            config.weights[f"{prefix}.self_attn.v_proj.weight"],
+        )
+        _copy_transposed_buffer(
+            fused,
+            f"W_attn_output_prefill_{layer_idx}",
+            config.weights[f"{prefix}.self_attn.o_proj.weight"],
+        )
+        _copy_buffer(
+            fused,
+            f"W_norm2_{layer_idx}",
+            config.weights[f"{prefix}.post_attention_layernorm.weight"],
+        )
+        _copy_transposed_buffer(
+            fused,
+            f"W_ffn_gate_prefill_{layer_idx}",
+            config.weights[f"{prefix}.mlp.gate_proj.weight"],
+        )
+        _copy_transposed_buffer(
+            fused,
+            f"W_ffn_up_prefill_{layer_idx}",
+            config.weights[f"{prefix}.mlp.up_proj.weight"],
+        )
+        _copy_transposed_buffer(
+            fused,
+            f"W_ffn_down_prefill_{layer_idx}",
+            config.weights[f"{prefix}.mlp.down_proj.weight"],
+        )
+
+    _copy_buffer(fused, "W_final_norm", config.weights["model.norm.weight"])
+
+
+def load_prefill_lm_head_weight_buffer(config, fused):
+    weight = config.weights["model.embed_tokens.weight"]
+    partition_width = config.padded_vocab_size // config.vocab_partitions
+    for part_idx in range(config.vocab_partitions):
+        part_start = part_idx * partition_width
+        part_end = min(part_start + partition_width, config.vocab_size)
+        view = fused.get_buffer(f"W_out_head_part_{part_idx}").torch_view().view(
+            partition_width,
+            config.emb_dim,
+        )
+        view.zero_()
+        if part_start < part_end:
+            view[: part_end - part_start, :] = weight[part_start:part_end, :]

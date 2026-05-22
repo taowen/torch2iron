@@ -553,6 +553,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         external_args={
             "weight": list(DECODE_TRANSFORMER_WEIGHT_NAMES),
             "lm_head": list(DECODE_LM_HEAD_WEIGHT_NAMES),
+            "kv_cache": list(DECODE_PACKET_CACHE_NAMES),
         },
         context=elf_ctx,
     ).compile()
