@@ -160,15 +160,7 @@ def load_prefill_fused_weight_buffers(config, fused):
 
 
 def load_prefill_lm_head_weight_buffer(config, fused):
-    weight = config.weights["model.embed_tokens.weight"]
-    partition_width = config.padded_vocab_size // config.vocab_partitions
-    for part_idx in range(config.vocab_partitions):
-        part_start = part_idx * partition_width
-        part_end = min(part_start + partition_width, config.vocab_size)
-        view = fused.get_buffer(f"W_out_head_part_{part_idx}").torch_view().view(
-            partition_width,
-            config.emb_dim,
-        )
-        view.zero_()
-        if part_start < part_end:
-            view[: part_end - part_start, :] = weight[part_start:part_end, :]
+    fused.get_buffer("W_out_head").torch_view().view(
+        config.vocab_size,
+        config.emb_dim,
+    )[:] = config.weights["model.embed_tokens.weight"]

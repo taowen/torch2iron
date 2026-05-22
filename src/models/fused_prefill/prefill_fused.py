@@ -21,6 +21,7 @@ from torch2iron.operators import (
     ElementwiseAdd,
     ElementwiseMul,
     GEMM,
+    GEMV,
     LlamaChunkedPrefillAttention,
     RMSNorm,
     RoPE,
@@ -36,7 +37,6 @@ from models.fused_prefill.runtime_config import (
     DECODE_ATTN_CHUNK_SIZE,
     PREFILL_CHUNK_COMPUTE_ROWS,
     PREFILL_CHUNK_SIZE,
-    PREFILL_LM_HEAD_ROWS,
 )
 
 
@@ -406,38 +406,21 @@ def build_prefill_fused_op(config, max_seq_len, build_suffix, dry_run=False):
 
 
 def build_prefill_lm_head_fused_op(config, build_suffix, dry_run=False):
-    _configure_prefill_vocab(config)
     context = AIEContext(build_dir=Path("build_prefill_elf") / f"{build_suffix}_lm_head")
-    partition_width = config.padded_vocab_size // config.vocab_partitions
-    lm_head_op = GEMM(
-        M=PREFILL_LM_HEAD_ROWS,
+    lm_head_op = GEMV(
+        M=config.vocab_size,
         K=config.emb_dim,
-        N=partition_width,
         num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
-        tile_m=PREFILL_LM_HEAD_ROWS // 4,
-        tile_k=PREFILL_GEMM_TILE_SIZE,
-        tile_n=PREFILL_GEMM_TILE_SIZE,
-        b_col_maj=True,
-        emulate_bf16_mmul_with_bfp16=False,
+        tile_size_input=4,
+        tile_size_output=32,
         context=context,
     )
-    lm_head_weight_names = [
-        f"W_out_head_part_{part_idx}" for part_idx in range(config.vocab_partitions)
-    ]
-    lm_head_output_names = [
-        f"logits_part_{part_idx}" for part_idx in range(config.vocab_partitions)
-    ]
     return FusedMLIROperator(
         "prefill_lm_head_fused_op",
-        [
-            (lm_head_op, "x", weight_name, output_name)
-            for weight_name, output_name in zip(
-                lm_head_weight_names, lm_head_output_names
-            )
-        ],
+        [(lm_head_op, "W_out_head", "x", "logits")],
         input_args=["x"],
-        output_args=lm_head_output_names,
-        external_args={"lm_head": lm_head_weight_names},
+        output_args=["logits"],
+        external_args={"lm_head": ["W_out_head"]},
         compile_mode="full_elf_dynamic",
         context=context,
     ).compile(dry_run=dry_run)

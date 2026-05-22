@@ -17,7 +17,6 @@ from models.fused_prefill.generated.decode_layout import DECODE_PACKET_CACHE_NAM
 from models.fused_prefill.runtime_config import (
     PREFILL_CHUNK_COMPUTE_ROWS,
     PREFILL_CHUNK_SIZE,
-    PREFILL_LM_HEAD_ROWS,
 )
 
 
@@ -72,23 +71,15 @@ def _run_lm_head_for_last_chunk(runner, hidden_out, valid_len):
     config = runner.config
     lm_head = runner.aie_ops.prefill.lm_head
 
-    x = lm_head.get_buffer("x").torch_view().view(PREFILL_LM_HEAD_ROWS, config.emb_dim)
-    x.zero_()
-    x[:valid_len, :] = hidden_out[:valid_len, :]
+    x = lm_head.get_buffer("x").torch_view().view(config.emb_dim)
+    x[:] = hidden_out[valid_len - 1, :]
 
     lm_head()
-    partition_width = config.padded_vocab_size // config.vocab_partitions
-    logits_padded = torch.cat(
-        [
-            lm_head.get_buffer(f"logits_part_{part_idx}").torch_view().view(
-                PREFILL_LM_HEAD_ROWS,
-                partition_width,
-            )
-            for part_idx in range(config.vocab_partitions)
-        ],
-        dim=1,
+    return lm_head.get_buffer("logits").torch_view().view(
+        1,
+        1,
+        config.vocab_size,
     )
-    return logits_padded.unsqueeze(0)[:, :valid_len, : config.vocab_size]
 
 
 def fused_prefill_forward_pass(runner, state):
