@@ -5,12 +5,12 @@
 
 from aie.utils.hostruntime.xrtruntime.tensor import xrt as pyxrt
 
-from models.exported_llama3.generated.decode_layout import (
+from models.exported_qwen3.generated.decode_layout import (
     DECODE_PACKET_CACHE_NAMES,
     DECODE_PRESENT_KEY_NAMES,
     DECODE_PRESENT_VALUE_NAMES,
 )
-from models.exported_llama3.runtime_config import DECODE_ATTN_CHUNK_SIZE
+from models.exported_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
 def decode_packet_chunk_elements(config, chunk_size=DECODE_ATTN_CHUNK_SIZE):

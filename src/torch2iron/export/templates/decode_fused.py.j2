@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generated decode fused operator for exported_llama3.
+"""Generated decode fused operator for {{ model_name }}.
 
 Regenerate with:
     uv run python -m {{ codegen_module }} --model-package {{ model_package }}
@@ -37,6 +37,16 @@ from {{ model_package }}.generated.decode_layout import (
     EXPORTED_DECODE_CHUNK_SIZE,
 )
 from {{ model_package }}.runtime_config import DECODE_ATTN_CHUNK_SIZE
+
+
+def _decode_lm_head_tile_size_output(config) -> int:
+    rows_per_column = config.vocab_size // 8
+    for tile_size_output in (32, 16, 8, 4):
+        if rows_per_column % tile_size_output == 0:
+            return tile_size_output
+    raise ValueError(
+        "decode lm_head vocab rows per AIE column must be divisible by 4, 8, 16, or 32"
+    )
 
 
 def build_decode_fused_op(config, prompt_len, build_suffix):
@@ -81,6 +91,22 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         rows=config.n_kv_groups,
         cols=config.head_dim,
         angle_rows=1,
+        context=elf_ctx,
+    )
+    attn_query_norm_op = RMSNorm(
+        size=config.n_heads * config.head_dim,
+        num_aie_columns=8,
+        num_channels=1,
+        tile_size=config.head_dim,
+        weighted=True,
+        context=elf_ctx,
+    )
+    attn_key_norm_op = RMSNorm(
+        size=config.n_kv_groups * config.head_dim,
+        num_aie_columns=8,
+        num_channels=1,
+        tile_size=config.head_dim,
+        weighted=True,
         context=elf_ctx,
     )
 
@@ -212,7 +238,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         K=config.emb_dim,
         num_aie_columns=8,
         tile_size_input=4,
-        tile_size_output=32,
+        tile_size_output=_decode_lm_head_tile_size_output(config),
         context=elf_ctx,
     )
 
@@ -224,8 +250,12 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         (rms_norm_op, "x", "W_norm1_{{ layer }}", "x_norm"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.q_proj") %}
         (gemv_attn_query_op, "W_attn_query_{{ layer }}", "x_norm", "queries"),
+{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.q_norm") %}
+        (attn_query_norm_op, "queries", "W_attn_query_norm_{{ layer }}", "queries"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.k_proj") %}
         (gemv_attn_key_value_op, "W_attn_key_{{ layer }}", "x_norm", "keys"),
+{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.k_norm") %}
+        (attn_key_norm_op, "keys", "W_attn_key_norm_{{ layer }}", "keys"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.v_proj") %}
         (gemv_attn_key_value_op, "W_attn_value_{{ layer }}", "x_norm", "values"),
 {% elif target_is(node, "torch2iron.rope.default") and tensor_rank(node) == 5 %}

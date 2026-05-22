@@ -3,10 +3,10 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generated fused prefill ELF builders for exported_llama3.
+"""Generated fused prefill ELF builders for exported_qwen3.
 
 Regenerate with:
-    uv run python -m torch2iron.export.codegen --model-package models.exported_llama3
+    uv run python -m torch2iron.export.codegen --model-package models.exported_qwen3
 
 The model topology, layer count, and layer weight list come from
 torch.export.ExportedProgram. Runtime-specific tiling parameters still enter
@@ -32,12 +32,12 @@ from torch2iron.operators import (
     StridedCopy,
 )
 
-from models.exported_llama3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
-from models.exported_llama3.generated.prefill_layout import (
+from models.exported_qwen3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
+from models.exported_qwen3.generated.prefill_layout import (
     EXPECTED_PREFILL_LAYERS,
     PREFILL_LAYER_WEIGHT_SPECS,
 )
-from models.exported_llama3.runtime_config import DECODE_ATTN_CHUNK_SIZE
+from models.exported_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
 BF16_BYTES = 2
@@ -396,6 +396,22 @@ def build_prefill_fused_op(
                 "x_norm",
                 f"W_attn_value_prefill_{layer_idx}",
                 "values",
+            )
+        )
+        runlist.append(
+            (
+                attn_query_norm_op,
+                "queries",
+                f"W_attn_query_norm_{layer_idx}",
+                "queries",
+            )
+        )
+        runlist.append(
+            (
+                attn_key_norm_op,
+                "keys",
+                f"W_attn_key_norm_{layer_idx}",
+                "keys",
             )
         )
         runlist.append((rope_queries_op, "queries", "rope_angles", "queries"))

@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generated fused prefill ELF builders for exported_llama3.
+"""Generated fused prefill ELF builders for {{ model_name }}.
 
 Regenerate with:
     uv run python -m {{ codegen_module }} --model-package {{ model_package }}
@@ -59,6 +59,16 @@ def _configure_prefill_vocab(config) -> None:
     )
     config.padded_vocab_size = (config.vocab_size + min_n - 1) // min_n * min_n
     config.vocab_partitions = PREFILL_VOCAB_PARTITIONS
+
+
+def _prefill_lm_head_tile_size_output(config) -> int:
+    rows_per_column = config.vocab_size // PREFILL_NUM_AIE_COLUMNS
+    for tile_size_output in (32, 16, 8, 4):
+        if rows_per_column % tile_size_output == 0:
+            return tile_size_output
+    raise ValueError(
+        "prefill lm_head vocab rows per AIE column must be divisible by 4, 8, 16, or 32"
+    )
 
 
 def _prefill_gemm(
@@ -214,6 +224,22 @@ def build_prefill_fused_op(
         angle_rows=compute_rows,
         context=context,
     )
+    attn_query_norm_op = RMSNorm(
+        size=q_elements,
+        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+        num_channels=1,
+        tile_size=head_dim,
+        weighted=True,
+        context=context,
+    )
+    attn_key_norm_op = RMSNorm(
+        size=kv_elements,
+        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
+        num_channels=1,
+        tile_size=head_dim,
+        weighted=True,
+        context=context,
+    )
     pack_queries_ops = [
         _strided_copy(
             context,
@@ -360,12 +386,30 @@ def build_prefill_fused_op(
                 "queries",
             )
         )
+{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.q_norm") %}
+        runlist.append(
+            (
+                attn_query_norm_op,
+                "queries",
+                f"W_attn_query_norm_{layer_idx}",
+                "queries",
+            )
+        )
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.k_proj") %}
         runlist.append(
             (
                 attn_key_value_op,
                 "x_norm",
                 f"W_attn_key_prefill_{layer_idx}",
+                "keys",
+            )
+        )
+{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.k_norm") %}
+        runlist.append(
+            (
+                attn_key_norm_op,
+                "keys",
+                f"W_attn_key_norm_{layer_idx}",
                 "keys",
             )
         )
@@ -494,7 +538,7 @@ def build_prefill_lm_head_fused_op(config, build_suffix, dry_run=False):
         K=config.emb_dim,
         num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
         tile_size_input=4,
-        tile_size_output=32,
+        tile_size_output=_prefill_lm_head_tile_size_output(config),
         context=context,
     )
     return FusedMLIROperator(

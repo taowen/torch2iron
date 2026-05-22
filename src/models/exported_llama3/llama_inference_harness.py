@@ -74,32 +74,10 @@ class LlamaModelState:
     def __init__(self, config):
         # Current IDs of tokens being processed (most recent token for decode; all prompt tokens for prefill)
         self.token_ids = torch.empty(0, dtype=torch.long)
-        self.reset_kv_cache(config)
+        self.reset_kv_cache()
 
-    def reset_kv_cache(self, config):
+    def reset_kv_cache(self):
         self.num_preceding_tokens = 0
-        # Set up KV cache -- initially empty
-        # This is what passes information from previous tokens to the current token during generation
-        self.attn_keys_caches = [
-            torch.empty(
-                1,
-                config.n_kv_groups,
-                0,
-                config.head_dim,
-                dtype=config.weights["model.layers.0.self_attn.k_proj.weight"].dtype,
-            )  # (batch_size, n_kv_groups, seq_len, head_dim)
-            for _ in range(config.n_layers)
-        ]
-        self.attn_values_caches = [
-            torch.empty(
-                1,
-                config.n_kv_groups,
-                0,
-                config.head_dim,
-                dtype=config.weights["model.layers.0.self_attn.v_proj.weight"].dtype,
-            )  # (batch_size, n_kv_groups, seq_len, head_dim)
-            for _ in range(config.n_layers)
-        ]
 
 
 # Utilities
@@ -254,7 +232,7 @@ def generate(config, state, forward_pass, num_tokens=100, use_kv_cache=True):
     if use_kv_cache:
         state.token_ids = torch.tensor([[first_token]], dtype=torch.long)
     else:
-        state.reset_kv_cache(config)
+        state.reset_kv_cache()
         state.token_ids = torch.cat(
             [state.token_ids, torch.tensor([[first_token]], dtype=torch.long)], dim=1
         )
@@ -267,7 +245,7 @@ def generate(config, state, forward_pass, num_tokens=100, use_kv_cache=True):
         if use_kv_cache:
             state.token_ids = torch.tensor([[next_token]], dtype=torch.long)
         else:
-            state.reset_kv_cache(config)
+            state.reset_kv_cache()
             state.token_ids = torch.cat(
                 [state.token_ids, torch.tensor([[next_token]], dtype=torch.long)], dim=1
             )

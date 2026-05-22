@@ -22,6 +22,15 @@ from torch2iron.export.model_tools import (
 
 
 CODEGEN_MODULE = "torch2iron.export.codegen"
+DEFAULT_CODEGEN_CONFIG = {
+    "vocab_size": 128,
+    "emb_dim": 32,
+    "n_layers": 16,
+    "n_heads": 4,
+    "n_kv_groups": 2,
+    "head_dim": 8,
+    "hidden_dim": 64,
+}
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -124,10 +133,18 @@ def decode_buffer_name(node) -> str | None:
         node, "self_attn.q_proj"
     ):
         return f"W_attn_query_{layer}"
+    if target_is(node, "aten.rms_norm.default") and path_endswith(
+        node, "self_attn.q_norm"
+    ):
+        return f"W_attn_query_norm_{layer}"
     if target_is(node, "aten.linear.default") and path_endswith(
         node, "self_attn.k_proj"
     ):
         return f"W_attn_key_{layer}"
+    if target_is(node, "aten.rms_norm.default") and path_endswith(
+        node, "self_attn.k_norm"
+    ):
+        return f"W_attn_key_norm_{layer}"
     if target_is(node, "aten.linear.default") and path_endswith(
         node, "self_attn.v_proj"
     ):
@@ -174,10 +191,18 @@ def prefill_buffer_name(node) -> str | None:
         node, "self_attn.q_proj"
     ):
         return "W_attn_query_prefill"
+    if target_is(node, "aten.rms_norm.default") and path_endswith(
+        node, "self_attn.q_norm"
+    ):
+        return "W_attn_query_norm"
     if target_is(node, "aten.linear.default") and path_endswith(
         node, "self_attn.k_proj"
     ):
         return "W_attn_key_prefill"
+    if target_is(node, "aten.rms_norm.default") and path_endswith(
+        node, "self_attn.k_norm"
+    ):
+        return "W_attn_key_norm"
     if target_is(node, "aten.linear.default") and path_endswith(
         node, "self_attn.v_proj"
     ):
@@ -236,19 +261,25 @@ def weight_source(exported_program, node) -> str | None:
     return _parameter_targets(exported_program)[parameter_node.name]
 
 
-def decode_weight_specs(exported_program) -> list[dict[str, object]]:
+def decode_weight_specs(
+    exported_program,
+    *,
+    weight_source_aliases: dict[str, str] | None = None,
+) -> list[dict[str, object]]:
+    weight_source_aliases = weight_source_aliases or {}
     specs = []
     for node in call_function_nodes(exported_program):
         name = decode_buffer_name(node)
         if name is None:
             continue
         group = "lm_head" if name == "W_out_head" else "weight"
+        source = weight_source(exported_program, node)
         specs.append(
             {
                 "layer": layer_idx(node),
                 "group": group,
                 "name": name,
-                "source": weight_source(exported_program, node),
+                "source": weight_source_aliases.get(source, source),
             }
         )
     return specs
@@ -276,16 +307,17 @@ def prefill_layer_weight_specs(exported_program) -> list[dict[str, object]]:
     return specs
 
 
+def _codegen_config_kwargs(tools: ModelExportTools) -> dict[str, int]:
+    kwargs = dict(DEFAULT_CODEGEN_CONFIG)
+    kwargs.update(getattr(tools.pytorch_modules, "CODEGEN_CONFIG", {}))
+    return kwargs
+
+
 def export_decode_program_for_codegen(tools: ModelExportTools) -> object:
     runtime_config = tools.runtime_config
+    config_kwargs = _codegen_config_kwargs(tools)
     config = tools.config_cls(
-        vocab_size=128,
-        emb_dim=32,
-        n_layers=16,
-        n_heads=4,
-        n_kv_groups=2,
-        head_dim=8,
-        hidden_dim=64,
+        **config_kwargs,
         max_seq_len=runtime_config.MIN_COMPILED_SEQ_LEN,
         chunk_size=runtime_config.DECODE_ATTN_CHUNK_SIZE,
     )
@@ -294,21 +326,20 @@ def export_decode_program_for_codegen(tools: ModelExportTools) -> object:
 
 def export_prefill_program_for_codegen(tools: ModelExportTools) -> object:
     runtime_config = tools.runtime_config
+    config_kwargs = _codegen_config_kwargs(tools)
     config = tools.config_cls(
-        vocab_size=128,
-        emb_dim=32,
-        n_layers=16,
-        n_heads=4,
-        n_kv_groups=2,
-        head_dim=8,
-        hidden_dim=64,
+        **config_kwargs,
         max_seq_len=8,
         chunk_size=runtime_config.DECODE_ATTN_CHUNK_SIZE,
     )
     return export_program(tools, config, "prefill")
 
 
-def _jinja_env(*, model_package: str) -> Environment:
+def _jinja_env(
+    *,
+    model_package: str,
+    weight_source_aliases: dict[str, str] | None = None,
+) -> Environment:
     template_dir = Path(__file__).with_name("templates")
     env = Environment(
         loader=FileSystemLoader(template_dir),
@@ -316,8 +347,11 @@ def _jinja_env(*, model_package: str) -> Environment:
         lstrip_blocks=True,
         keep_trailing_newline=True,
     )
+    weight_source_aliases = weight_source_aliases or {}
+    model_name = model_package.rsplit(".", 1)[-1]
     env.globals.update(
         model_package=model_package,
+        model_name=model_name,
         codegen_module=CODEGEN_MODULE,
         call_function_nodes=call_function_nodes,
         path_endswith=path_endswith,
@@ -331,32 +365,51 @@ def _jinja_env(*, model_package: str) -> Environment:
         decode_chunk_size=decode_chunk_size,
         decode_transformer_weight_names=decode_transformer_weight_names,
         decode_lm_head_weight_names=decode_lm_head_weight_names,
-        decode_weight_specs=decode_weight_specs,
+        decode_weight_specs=lambda exported_program: decode_weight_specs(
+            exported_program,
+            weight_source_aliases=weight_source_aliases,
+        ),
         prefill_layer_weight_specs=prefill_layer_weight_specs,
     )
     return env
 
 
 def render_decode_layout(exported_program, *, model_package: str) -> str:
-    return _jinja_env(model_package=model_package).get_template(
+    tools = load_model_export_tools(model_package)
+    return _jinja_env(
+        model_package=model_package,
+        weight_source_aliases=tools.weight_source_aliases,
+    ).get_template(
         "decode_layout.py.j2"
     ).render(exported_program=exported_program)
 
 
 def render_prefill_layout(exported_program, *, model_package: str) -> str:
-    return _jinja_env(model_package=model_package).get_template(
+    tools = load_model_export_tools(model_package)
+    return _jinja_env(
+        model_package=model_package,
+        weight_source_aliases=tools.weight_source_aliases,
+    ).get_template(
         "prefill_layout.py.j2"
     ).render(exported_program=exported_program)
 
 
 def render_decode_fused(exported_program, *, model_package: str) -> str:
-    return _jinja_env(model_package=model_package).get_template(
+    tools = load_model_export_tools(model_package)
+    return _jinja_env(
+        model_package=model_package,
+        weight_source_aliases=tools.weight_source_aliases,
+    ).get_template(
         "decode_fused.py.j2"
     ).render(exported_program=exported_program)
 
 
 def render_prefill_operators(exported_program, *, model_package: str) -> str:
-    return _jinja_env(model_package=model_package).get_template(
+    tools = load_model_export_tools(model_package)
+    return _jinja_env(
+        model_package=model_package,
+        weight_source_aliases=tools.weight_source_aliases,
+    ).get_template(
         "prefill_operators.py.j2"
     ).render(exported_program=exported_program)
 

@@ -3,9 +3,9 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small PyTorch Llama modules used only for ``torch.export`` inspection.
+"""Small PyTorch Qwen modules used only for ``torch.export`` inspection.
 
-These modules are not wired into the runtime path.  They keep the Llama block
+These modules are not wired into the runtime path.  They keep the Qwen block
 structure and a few important semantic boundaries visible so
 ``torch2iron.export.dump_exported_program`` can show what PyTorch export emits.
 """
@@ -20,12 +20,10 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-WEIGHT_SOURCE_ALIASES = {
-    "lm_head.weight": "model.embed_tokens.weight",
-}
+WEIGHT_SOURCE_ALIASES = {}
 
 CODEGEN_CONFIG = {
-    "n_layers": 16,
+    "n_layers": 28,
 }
 
 
@@ -129,7 +127,7 @@ def llama_chunked_attention(
 
 
 @dataclass(frozen=True)
-class LlamaExportConfig:
+class QwenExportConfig:
     vocab_size: int = 128
     emb_dim: int = 32
     n_layers: int = 2
@@ -139,7 +137,7 @@ class LlamaExportConfig:
     hidden_dim: int = 64
     max_seq_len: int = 8
     chunk_size: int = 4
-    rms_norm_eps: float = 1e-5
+    rms_norm_eps: float = 1e-6
 
     @property
     def q_heads_per_group(self) -> int:
@@ -162,8 +160,8 @@ class ExportRMSNorm(nn.Module):
         return F.rms_norm(x, (self.weight.shape[0],), self.weight, eps=self.eps)
 
 
-class ExportLlamaMLP(nn.Module):
-    def __init__(self, config: LlamaExportConfig) -> None:
+class ExportQwenMLP(nn.Module):
+    def __init__(self, config: QwenExportConfig) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(config.emb_dim, config.hidden_dim, bias=False)
         self.up_proj = nn.Linear(config.emb_dim, config.hidden_dim, bias=False)
@@ -176,7 +174,7 @@ class ExportLlamaMLP(nn.Module):
 
 
 class ExportPrefillAttention(nn.Module):
-    def __init__(self, config: LlamaExportConfig) -> None:
+    def __init__(self, config: QwenExportConfig) -> None:
         super().__init__()
         self.config = config
         self.q_proj = nn.Linear(
@@ -191,6 +189,8 @@ class ExportPrefillAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.n_heads * config.head_dim, config.emb_dim, bias=False
         )
+        self.q_norm = ExportRMSNorm(config.head_dim, config.rms_norm_eps)
+        self.k_norm = ExportRMSNorm(config.head_dim, config.rms_norm_eps)
 
     def forward(self, x: Tensor, rope_angles: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         batch, seq_len, _ = x.shape
@@ -200,6 +200,8 @@ class ExportPrefillAttention(nn.Module):
         keys = self.k_proj(x).view(batch, seq_len, cfg.n_kv_groups, cfg.head_dim)
         values = self.v_proj(x).view(batch, seq_len, cfg.n_kv_groups, cfg.head_dim)
 
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
         queries = rope(queries, rope_angles)
         keys = rope(keys, rope_angles)
 
@@ -218,7 +220,7 @@ class ExportPrefillAttention(nn.Module):
 
 
 class ExportChunkedDecodeAttention(nn.Module):
-    def __init__(self, config: LlamaExportConfig) -> None:
+    def __init__(self, config: QwenExportConfig) -> None:
         super().__init__()
         self.config = config
         self.q_proj = nn.Linear(
@@ -233,6 +235,8 @@ class ExportChunkedDecodeAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.n_heads * config.head_dim, config.emb_dim, bias=False
         )
+        self.q_norm = ExportRMSNorm(config.head_dim, config.rms_norm_eps)
+        self.k_norm = ExportRMSNorm(config.head_dim, config.rms_norm_eps)
 
     def forward(
         self,
@@ -253,6 +257,8 @@ class ExportChunkedDecodeAttention(nn.Module):
         keys = self.k_proj(x).view(batch, seq_len, cfg.n_kv_groups, cfg.head_dim)
         values = self.v_proj(x).view(batch, seq_len, cfg.n_kv_groups, cfg.head_dim)
 
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
         queries = rope(queries, rope_angles)
         keys = rope(keys, rope_angles)
 
@@ -268,15 +274,15 @@ class ExportChunkedDecodeAttention(nn.Module):
         return self.o_proj(context), keys, values
 
 
-class ExportLlamaPrefillLayer(nn.Module):
-    def __init__(self, config: LlamaExportConfig) -> None:
+class ExportQwenPrefillLayer(nn.Module):
+    def __init__(self, config: QwenExportConfig) -> None:
         super().__init__()
         self.input_layernorm = ExportRMSNorm(config.emb_dim, config.rms_norm_eps)
         self.self_attn = ExportPrefillAttention(config)
         self.post_attention_layernorm = ExportRMSNorm(
             config.emb_dim, config.rms_norm_eps
         )
-        self.mlp = ExportLlamaMLP(config)
+        self.mlp = ExportQwenMLP(config)
 
     def forward(self, hidden_states: Tensor, rope_angles: Tensor):
         residual = hidden_states
@@ -292,15 +298,15 @@ class ExportLlamaPrefillLayer(nn.Module):
         return hidden_states, present_key, present_value
 
 
-class ExportLlamaDecodeLayer(nn.Module):
-    def __init__(self, config: LlamaExportConfig) -> None:
+class ExportQwenDecodeLayer(nn.Module):
+    def __init__(self, config: QwenExportConfig) -> None:
         super().__init__()
         self.input_layernorm = ExportRMSNorm(config.emb_dim, config.rms_norm_eps)
         self.self_attn = ExportChunkedDecodeAttention(config)
         self.post_attention_layernorm = ExportRMSNorm(
             config.emb_dim, config.rms_norm_eps
         )
-        self.mlp = ExportLlamaMLP(config)
+        self.mlp = ExportQwenMLP(config)
 
     def forward(self, hidden_states: Tensor, rope_angles: Tensor, packet_cache: Tensor):
         residual = hidden_states
@@ -316,11 +322,11 @@ class ExportLlamaDecodeLayer(nn.Module):
         return hidden_states, present_key, present_value
 
 
-class ExportLlamaPrefillModel(nn.Module):
-    def __init__(self, config: LlamaExportConfig) -> None:
+class ExportQwenPrefillModel(nn.Module):
+    def __init__(self, config: QwenExportConfig) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [ExportLlamaPrefillLayer(config) for _ in range(config.n_layers)]
+            [ExportQwenPrefillLayer(config) for _ in range(config.n_layers)]
         )
         self.norm = ExportRMSNorm(config.emb_dim, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.emb_dim, config.vocab_size, bias=False)
@@ -341,11 +347,11 @@ class ExportLlamaPrefillModel(nn.Module):
         }
 
 
-class ExportLlamaDecodeModel(nn.Module):
-    def __init__(self, config: LlamaExportConfig) -> None:
+class ExportQwenDecodeModel(nn.Module):
+    def __init__(self, config: QwenExportConfig) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [ExportLlamaDecodeLayer(config) for _ in range(config.n_layers)]
+            [ExportQwenDecodeLayer(config) for _ in range(config.n_layers)]
         )
         self.norm = ExportRMSNorm(config.emb_dim, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.emb_dim, config.vocab_size, bias=False)
@@ -371,16 +377,21 @@ class ExportLlamaDecodeModel(nn.Module):
         }
 
 
-def example_prefill_args(config: LlamaExportConfig) -> tuple[Tensor, ...]:
+def example_prefill_args(config: QwenExportConfig) -> tuple[Tensor, ...]:
     x = torch.randn(1, config.max_seq_len, config.emb_dim)
     rope_angles = torch.randn(config.max_seq_len, config.head_dim)
     return (x, rope_angles)
 
 
-def example_decode_args(config: LlamaExportConfig) -> tuple[Tensor, ...]:
+def example_decode_args(config: QwenExportConfig) -> tuple[Tensor, ...]:
     x = torch.randn(1, 1, config.emb_dim)
     rope_angles = torch.randn(1, config.head_dim)
     packet_caches = tuple(
         torch.randn(config.packet_cache_elements) for _ in range(config.n_layers)
     )
     return (x, rope_angles, *packet_caches)
+
+
+ExportConfig = QwenExportConfig
+ExportPrefillModel = ExportQwenPrefillModel
+ExportDecodeModel = ExportQwenDecodeModel

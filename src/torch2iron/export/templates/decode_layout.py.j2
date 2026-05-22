@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generated decode layout constants for exported_llama3.
+"""Generated decode layout constants for {{ model_name }}.
 
 Regenerate with:
     uv run python -m {{ codegen_module }} --model-package {{ model_package }}
@@ -56,9 +56,7 @@ DECODE_WEIGHT_SPECS = (
         "layer": {{ spec["layer"] if spec["layer"] is not none else "None" }},
         "group": "{{ spec["group"] }}",
         "name": "{{ spec["name"] }}",
-{% if export_source == "lm_head.weight" %}
-        "source": "model.embed_tokens.weight",
-{% elif export_source == "norm.weight" or export_source.startswith("layers.") %}
+{% if export_source == "norm.weight" or export_source.startswith("layers.") %}
         "source": "model.{{ export_source }}",
 {% else %}
         "source": "{{ export_source }}",

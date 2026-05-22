@@ -13,19 +13,19 @@
 
 import torch
 from pathlib import Path
-from models.exported_llama3 import llama_inference_harness as harness
-from models.exported_llama3.aie_operators import AIELlamaOperators
-from models.exported_llama3.decode_packet_cache import (
+from models.exported_qwen3 import qwen_inference_harness as harness
+from models.exported_qwen3.aie_operators import AIEQwenOperators
+from models.exported_qwen3.decode_packet_cache import (
     append_decode_kv_cache,
     copy_decode_packet_cache_tokens,
     mark_decode_current_cache_slot,
 )
-from models.exported_llama3.llama_packed_weights import (
-    default_llama_packed_weights_dir,
-    write_llama_packed_weight_artifact,
+from models.exported_qwen3.qwen_packed_weights import (
+    default_qwen_packed_weights_dir,
+    write_qwen_packed_weight_artifact,
 )
-from models.exported_llama3.prefill_runtime import prefill_forward_pass
-from models.exported_llama3.runtime_config import (
+from models.exported_qwen3.prefill_runtime import prefill_forward_pass
+from models.exported_qwen3.runtime_config import (
     select_compiled_seq_len,
     select_decode_context_len,
     select_decode_variant_seq_len,
@@ -33,17 +33,17 @@ from models.exported_llama3.runtime_config import (
 import logging
 
 
-class LlamaNpuRunner:
+class QwenNpuRunner:
     def __init__(self, config, prefill_seq_len, decode_max_seq_len):
         self.config = config
         self.prefill_max_seq_len = prefill_seq_len
         self.max_seq_len = decode_max_seq_len
-        self.aie_ops = AIELlamaOperators(config, prefill_seq_len, decode_max_seq_len)
+        self.aie_ops = AIEQwenOperators(config, prefill_seq_len, decode_max_seq_len)
         self.active_decode_variant = None
 
     def forward_pass(self, config, state):
         if config is not self.config:
-            raise ValueError("LlamaNpuRunner was called with a different config")
+            raise ValueError("QwenNpuRunner was called with a different config")
         _, seq_len = state.token_ids.shape
         if seq_len > 1:
             ret = self.prefill(state)
@@ -138,7 +138,7 @@ def _decode_forward_pass(runner, config, state):
     x = torch.nn.functional.embedding(state.token_ids, tok_emb_weight)
     fused.get_buffer("x").torch_view().view(-1, config.emb_dim)[:seq_len, :] = x
 
-    # Fused NPU operator for all of decode (16 transformer blocks + final norm + final linear layer)
+    # Fused NPU operator for all decode transformer blocks, final norm, and lm_head.
     fused.input_buffer.to("cpu")
     fused()  # FusedFullELFCallable.__call__() syncs output_buffer to cpu
     append_decode_kv_cache(
@@ -175,20 +175,20 @@ def main():
     packed_weights_dir = (
         Path(args.packed_weights_dir)
         if args.packed_weights_dir is not None
-        else default_llama_packed_weights_dir(args.weights_path)
+        else default_qwen_packed_weights_dir(args.weights_path)
     )
     config.packed_weights_dir = packed_weights_dir
     config.require_packed_weights = args.require_packed_weights
 
     if args.prepare_weights:
-        manifest = write_llama_packed_weight_artifact(config, packed_weights_dir)
+        manifest = write_qwen_packed_weight_artifact(config, packed_weights_dir)
         print(f"packed_weights_dir: {packed_weights_dir}")
         print(f"packed_weights_file: {packed_weights_dir / 'weights.bf16.bin'}")
         print(f"packed_manifest_file: {packed_weights_dir / 'manifest.json'}")
         print(f"packed_total_bytes: {manifest['total_bytes']}")
         return
 
-    runner = LlamaNpuRunner(config, prefill_seq_len, max_seq_len)
+    runner = QwenNpuRunner(config, prefill_seq_len, max_seq_len)
 
     print(prompt, end="", flush=True)
     harness.generate(

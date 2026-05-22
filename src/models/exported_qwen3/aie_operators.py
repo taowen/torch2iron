@@ -11,18 +11,18 @@ from types import SimpleNamespace
 from iron.common.context import AIEContext
 from torch2iron.fusion import FusedFullELFCallable
 
-from models.exported_llama3.generated.decode_fused import build_decode_fused_op
-from models.exported_llama3.generated.prefill_layout import PREFILL_LAYER_WEIGHT_SPECS
-from models.exported_llama3.generated.prefill_operators import (
+from models.exported_qwen3.generated.decode_fused import build_decode_fused_op
+from models.exported_qwen3.generated.prefill_layout import PREFILL_LAYER_WEIGHT_SPECS
+from models.exported_qwen3.generated.prefill_operators import (
     build_prefill_fused_op,
     build_prefill_lm_head_fused_op,
 )
-from models.exported_llama3.llama_packed_weights import (
-    load_llama_packed_segment,
-    validate_llama_packed_weight_artifact,
+from models.exported_qwen3.qwen_packed_weights import (
+    load_qwen_packed_segment,
+    validate_qwen_packed_weight_artifact,
 )
-from models.exported_llama3.llama_weight_layout import iter_llama_decode_weight_specs
-from models.exported_llama3.runtime_config import (
+from models.exported_qwen3.qwen_weight_layout import iter_qwen_decode_weight_specs
+from models.exported_qwen3.runtime_config import (
     iter_decode_variant_seq_lens,
     select_prefill_chunk_config,
 )
@@ -36,7 +36,7 @@ class AIEDecodeVariant:
     current_cache_slot: int
 
 
-class AIELlamaOperators:
+class AIEQwenOperators:
     def __init__(self, config, prefill_seq_len, decode_max_seq_len):
         build_suffix = f"prefill{prefill_seq_len}_decode{decode_max_seq_len}"
         self.context = AIEContext(build_dir=Path("build") / build_suffix)
@@ -129,19 +129,19 @@ def load_decode_weight_buffers(config, fused):
     require_packed = getattr(config, "require_packed_weights", False)
     manifest = None
     if packed_dir is not None and Path(packed_dir).exists():
-        manifest = validate_llama_packed_weight_artifact(config, packed_dir)
+        manifest = validate_qwen_packed_weight_artifact(config, packed_dir)
         logging.info("Loading decode weights from packed artifact: %s", packed_dir)
     elif require_packed:
         raise FileNotFoundError(f"packed weights required but not found at {packed_dir}")
     else:
         logging.info("Loading decode weights from safetensors tensors")
 
-    for spec in iter_llama_decode_weight_specs(config):
+    for spec in iter_qwen_decode_weight_specs(config):
         view = fused.get_buffer(spec["name"]).torch_view()
         if manifest is None:
             view[:] = config.weights[spec["source"]].flatten()
         else:
-            view[:] = load_llama_packed_segment(
+            view[:] = load_qwen_packed_segment(
                 packed_dir, manifest, spec["name"]
             ).flatten()
 
@@ -172,4 +172,4 @@ def load_prefill_lm_head_weight_buffer(config, fused):
     fused.get_buffer("W_out_head").torch_view().view(
         config.vocab_size,
         config.emb_dim,
-    )[:] = config.weights["model.embed_tokens.weight"]
+    )[:] = config.weights[config.lm_head_weight_source]

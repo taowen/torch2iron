@@ -24,7 +24,14 @@ class ModelExportTools:
 
     @property
     def config_cls(self):
+        config_cls = getattr(self.pytorch_modules, "ExportConfig", None)
+        if config_cls is not None:
+            return config_cls
         return self.pytorch_modules.LlamaExportConfig
+
+    @property
+    def weight_source_aliases(self) -> dict[str, str]:
+        return dict(getattr(self.pytorch_modules, "WEIGHT_SOURCE_ALIASES", {}))
 
 
 def load_model_export_tools(model_package: str = DEFAULT_MODEL_PACKAGE) -> ModelExportTools:
@@ -72,10 +79,16 @@ def export_program(
     mode: str,
 ) -> torch.export.ExportedProgram:
     if mode == "prefill":
-        model = tools.pytorch_modules.ExportLlamaPrefillModel(config).eval()
+        model_cls = getattr(tools.pytorch_modules, "ExportPrefillModel", None)
+        if model_cls is None:
+            model_cls = tools.pytorch_modules.ExportLlamaPrefillModel
+        model = model_cls(config).eval()
         args = tools.pytorch_modules.example_prefill_args(config)
     elif mode == "decode":
-        model = tools.pytorch_modules.ExportLlamaDecodeModel(config).eval()
+        model_cls = getattr(tools.pytorch_modules, "ExportDecodeModel", None)
+        if model_cls is None:
+            model_cls = tools.pytorch_modules.ExportLlamaDecodeModel
+        model = model_cls(config).eval()
         args = tools.pytorch_modules.example_decode_args(config)
     else:
         raise ValueError(f"unsupported mode: {mode}")
