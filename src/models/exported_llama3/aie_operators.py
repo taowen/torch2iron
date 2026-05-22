@@ -7,27 +7,22 @@ import logging
 from pathlib import Path
 
 from iron.common.context import AIEContext
-from torch2iron.fusion import FusedFullELFCallable, FusedMLIROperator
+from torch2iron.fusion import FusedFullELFCallable
 from torch2iron.operators import (
     ElementwiseAdd,
     ElementwiseMul,
     GEMM,
-    GEMV,
-    LlamaChunkedAttention,
     RMSNorm,
     RoPE,
     SiLU,
-    StridedCopy,
 )
 
+from models.exported_llama3.generated.decode_fused import build_decode_fused_op
 from models.exported_llama3.llama_weight_layout import (
     iter_llama_decode_weight_specs,
-    llama_decode_lm_head_weight_names,
-    llama_decode_transformer_weight_names,
     load_llama_packed_segment,
     validate_llama_packed_weight_artifact,
 )
-from models.exported_llama3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
 class AIEPrefillOperations:
@@ -243,264 +238,9 @@ class AIELlamaOperators:
         )
 
     def _build_decode_ops(self, config, prompt_len, build_suffix):
-        elf_ctx = AIEContext(build_dir=Path("build_elf") / build_suffix)
-
-        gemv_attn_query_op = GEMV(
-            M=config.n_heads * config.head_dim,
-            K=config.emb_dim,
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=config.head_dim // 2,
-            context=elf_ctx,
+        self.decode.fused_op, self.decode.current_cache_slot = build_decode_fused_op(
+            config, prompt_len, build_suffix
         )
-
-        gemv_attn_key_value_op = GEMV(
-            M=config.n_kv_groups * config.head_dim,
-            K=config.emb_dim,
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=config.head_dim // 2,
-            context=elf_ctx,
-        )
-
-        rope_queries_op = RoPE(
-            rows=config.n_heads, cols=config.head_dim, angle_rows=1, context=elf_ctx
-        )
-        rope_keys_op = RoPE(
-            rows=config.n_kv_groups,
-            cols=config.head_dim,
-            angle_rows=1,
-            context=elf_ctx,
-        )
-
-        self.decode.current_cache_slot = prompt_len - 1
-        packet_chunk_elements = (
-            2 * DECODE_ATTN_CHUNK_SIZE * config.head_dim + DECODE_ATTN_CHUNK_SIZE
-        )
-        packet_elements_per_group = (
-            prompt_len // DECODE_ATTN_CHUNK_SIZE * packet_chunk_elements
-        )
-        packet_elements = config.n_kv_groups * packet_elements_per_group
-        current_chunk = self.decode.current_cache_slot // DECODE_ATTN_CHUNK_SIZE
-        current_row = self.decode.current_cache_slot % DECODE_ATTN_CHUNK_SIZE
-        current_k_packet_offset = (
-            current_chunk * packet_chunk_elements + current_row * config.head_dim
-        )
-        current_v_packet_offset = (
-            current_chunk * packet_chunk_elements
-            + DECODE_ATTN_CHUNK_SIZE * config.head_dim
-            + current_row * config.head_dim
-        )
-
-        strided_copy_packet_key_op = StridedCopy(
-            input_sizes=(config.n_kv_groups, config.head_dim),
-            input_strides=(config.head_dim, 1),
-            input_offset=0,
-            output_sizes=(config.n_kv_groups, config.head_dim),
-            output_strides=(packet_elements_per_group, 1),
-            output_offset=current_k_packet_offset,
-            input_buffer_size=config.n_kv_groups * config.head_dim,
-            output_buffer_size=packet_elements,
-            num_aie_channels=1,
-            context=elf_ctx,
-        )
-
-        strided_copy_packet_value_op = StridedCopy(
-            input_sizes=(config.n_kv_groups, config.head_dim),
-            input_strides=(config.head_dim, 1),
-            input_offset=0,
-            output_sizes=(config.n_kv_groups, config.head_dim),
-            output_strides=(packet_elements_per_group, 1),
-            output_offset=current_v_packet_offset,
-            input_buffer_size=config.n_kv_groups * config.head_dim,
-            output_buffer_size=packet_elements,
-            num_aie_channels=1,
-            context=elf_ctx,
-        )
-
-        copy_present_kv_op = StridedCopy(
-            input_sizes=(config.n_kv_groups, config.head_dim),
-            input_strides=(config.head_dim, 1),
-            input_offset=0,
-            output_sizes=(config.n_kv_groups, config.head_dim),
-            output_strides=(config.head_dim, 1),
-            output_offset=0,
-            input_buffer_size=config.n_kv_groups * config.head_dim,
-            output_buffer_size=config.n_kv_groups * config.head_dim,
-            num_aie_channels=1,
-            context=elf_ctx,
-        )
-
-        llama_chunked_attention_op = LlamaChunkedAttention(
-            max_seq_len=prompt_len,
-            num_kv_groups=config.n_kv_groups,
-            q_heads_per_group=config.n_heads // config.n_kv_groups,
-            head_dim=config.head_dim,
-            chunk_size=DECODE_ATTN_CHUNK_SIZE,
-            context=elf_ctx,
-        )
-
-        gemv_attn_output_op = GEMV(
-            M=config.emb_dim,
-            K=config.n_heads * config.head_dim,
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=config.emb_dim // 8,
-            context=elf_ctx,
-        )
-
-        rms_norm_op = RMSNorm(
-            size=config.emb_dim,
-            num_aie_columns=1,
-            num_channels=1,
-            tile_size=config.emb_dim,
-            weighted=True,
-            context=elf_ctx,
-        )
-
-        gemv_ffn_up_gate_op = GEMV(
-            M=config.hidden_dim,
-            K=config.emb_dim,
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=config.hidden_dim // 8,
-            context=elf_ctx,
-        )
-
-        gemv_ffn_down_op = GEMV(
-            M=config.emb_dim,
-            K=config.hidden_dim,
-            num_aie_columns=8,
-            tile_size_input=1,
-            tile_size_output=config.emb_dim // 8,
-            context=elf_ctx,
-        )
-
-        silu_ffn_op = SiLU(
-            size=config.hidden_dim,
-            tile_size=config.hidden_dim // 8,
-            num_aie_columns=8,
-            context=elf_ctx,
-        )
-
-        eltwise_mul_ffn_op = ElementwiseMul(
-            size=config.hidden_dim,
-            tile_size=config.hidden_dim // 8,
-            num_aie_columns=8,
-            context=elf_ctx,
-        )
-
-        residual_add_op = ElementwiseAdd(
-            size=config.emb_dim, tile_size=config.emb_dim // 8, context=elf_ctx
-        )
-
-        gemv_out_head_op = GEMV(
-            M=config.vocab_size,
-            K=config.emb_dim,
-            num_aie_columns=8,
-            tile_size_input=4,
-            tile_size_output=32,
-            context=elf_ctx,
-        )
-
-        packet_cache_buffer_size = packet_elements * 2  # bfloat16 byte size
-        runlist = []
-        for layer_idx in range(config.n_layers):
-            runlist.extend(
-                [
-                    (rms_norm_op, "x", f"W_norm1_{layer_idx}", "x_norm"),
-                    (
-                        gemv_attn_query_op,
-                        f"W_attn_query_{layer_idx}",
-                        "x_norm",
-                        "queries",
-                    ),
-                    (
-                        gemv_attn_key_value_op,
-                        f"W_attn_key_{layer_idx}",
-                        "x_norm",
-                        "keys",
-                    ),
-                    (
-                        gemv_attn_key_value_op,
-                        f"W_attn_value_{layer_idx}",
-                        "x_norm",
-                        "values",
-                    ),
-                    (rope_queries_op, "queries", "rope_angles", "queries"),
-                    (rope_keys_op, "keys", "rope_angles", "keys"),
-                    (copy_present_kv_op, "keys", f"present_keys_{layer_idx}"),
-                    (copy_present_kv_op, "values", f"present_values_{layer_idx}"),
-                    (
-                        strided_copy_packet_key_op,
-                        "keys",
-                        f"packet_cache_{layer_idx}",
-                    ),
-                    (
-                        strided_copy_packet_value_op,
-                        "values",
-                        f"packet_cache_{layer_idx}",
-                    ),
-                    (
-                        llama_chunked_attention_op,
-                        "queries",
-                        f"packet_cache_{layer_idx}",
-                        "attn_context",
-                    ),
-                    (
-                        gemv_attn_output_op,
-                        f"W_attn_output_decode_{layer_idx}",
-                        "attn_context",
-                        "attn_output",
-                    ),
-                    (residual_add_op, "x", "attn_output", "x"),
-                    (rms_norm_op, "x", f"W_norm2_{layer_idx}", "x_norm"),
-                    (
-                        gemv_ffn_up_gate_op,
-                        f"W_ffn_gate_{layer_idx}",
-                        "x_norm",
-                        "ffn_gate",
-                    ),
-                    (gemv_ffn_up_gate_op, f"W_ffn_up_{layer_idx}", "x_norm", "ffn_up"),
-                    (silu_ffn_op, "ffn_gate", "ffn_gate"),
-                    (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
-                    (
-                        gemv_ffn_down_op,
-                        f"W_ffn_down_{layer_idx}",
-                        "ffn_hidden",
-                        "ffn_output",
-                    ),
-                    (residual_add_op, "x", "ffn_output", "x"),
-                ]
-            )
-        runlist += [
-            (rms_norm_op, "x", "W_final_norm", "hidden_out"),
-            (gemv_out_head_op, "W_out_head", "hidden_out", "logits"),
-        ]
-
-        self.decode.fused_op = FusedMLIROperator(
-            "fused_op",
-            runlist,
-            input_args=["x", "rope_angles"],
-            output_args=[
-                "logits",
-                *[f"present_keys_{layer_idx}" for layer_idx in range(config.n_layers)],
-                *[
-                    f"present_values_{layer_idx}"
-                    for layer_idx in range(config.n_layers)
-                ],
-            ],
-            buffer_sizes={
-                f"packet_cache_{layer_idx}": packet_cache_buffer_size
-                for layer_idx in range(config.n_layers)
-            },
-            external_args={
-                "weight": llama_decode_transformer_weight_names(config),
-                "lm_head": llama_decode_lm_head_weight_names(config),
-            },
-            context=elf_ctx,
-        ).compile()
-
         self.decode.fused = FusedFullELFCallable(self.decode.fused_op)
 
         load_decode_weight_buffers(config, self.decode.fused)

@@ -86,8 +86,10 @@ def _llama_chunked_attention_impl(
     keys: Tensor,
     values: Tensor,
     packet_cache: Tensor,
+    max_seq_len: int,
+    chunk_size: int,
 ) -> Tensor:
-    del keys, values, packet_cache
+    del keys, values, packet_cache, max_seq_len, chunk_size
     return torch.zeros_like(queries)
 
 
@@ -97,8 +99,10 @@ def _(
     keys: Tensor,
     values: Tensor,
     packet_cache: Tensor,
+    max_seq_len: int,
+    chunk_size: int,
 ) -> Tensor:
-    del keys, values, packet_cache
+    del keys, values, packet_cache, max_seq_len, chunk_size
     return queries.new_empty(queries.shape)
 
 
@@ -107,9 +111,11 @@ def llama_chunked_attention(
     keys: Tensor,
     values: Tensor,
     packet_cache: Tensor,
+    max_seq_len: int,
+    chunk_size: int,
 ) -> Tensor:
     return torch.ops.torch2iron.llama_chunked_attention.default(
-        queries, keys, values, packet_cache
+        queries, keys, values, packet_cache, max_seq_len, chunk_size
     )
 
 
@@ -241,7 +247,14 @@ class ExportChunkedDecodeAttention(nn.Module):
         queries = rope(queries, rope_angles)
         keys = rope(keys, rope_angles)
 
-        context = llama_chunked_attention(queries, keys, values, packet_cache)
+        context = llama_chunked_attention(
+            queries,
+            keys,
+            values,
+            packet_cache,
+            cfg.max_seq_len,
+            cfg.chunk_size,
+        )
         context = context.reshape(batch, seq_len, cfg.n_heads * cfg.head_dim)
         return self.o_proj(context), keys, values
 
