@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate exported_llama3 runtime code directly from torch.export graphs."""
+"""Generate fused_prefill runtime code directly from torch.export graphs."""
 
 from __future__ import annotations
 
@@ -182,6 +182,10 @@ def prefill_buffer_name(node) -> str | None:
     ):
         return "W_attn_value_prefill"
     if target_is(node, "aten.linear.default") and path_endswith(
+        node, "self_attn.o_proj"
+    ):
+        return "W_attn_output_prefill"
+    if target_is(node, "aten.linear.default") and path_endswith(
         node, "mlp.gate_proj"
     ):
         return "W_ffn_gate_prefill"
@@ -351,12 +355,6 @@ def render_decode_fused(exported_program) -> str:
     )
 
 
-def render_prefill_runtime(exported_program) -> str:
-    return _jinja_env().get_template("prefill_runtime.py.j2").render(
-        exported_program=exported_program
-    )
-
-
 def render_prefill_operators(exported_program) -> str:
     return _jinja_env().get_template("prefill_operators.py.j2").render(
         exported_program=exported_program
@@ -370,14 +368,13 @@ def render_generated_files() -> dict[str, str]:
         "decode_layout.py": render_decode_layout(decode_program),
         "prefill_layout.py": render_prefill_layout(prefill_program),
         "decode_fused.py": render_decode_fused(decode_program),
-        "prefill_runtime.py": render_prefill_runtime(prefill_program),
         "prefill_operators.py": render_prefill_operators(prefill_program),
     }
 
 
 def _parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        description="Generate exported_llama3 runtime code from torch.export graphs"
+        description="Generate fused_prefill runtime code from torch.export graphs"
     )
     parser.add_argument(
         "--output-dir",

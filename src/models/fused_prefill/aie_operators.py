@@ -11,15 +11,16 @@ from iron.common.context import AIEContext
 from torch2iron.fusion import FusedFullELFCallable
 
 from models.fused_prefill.generated.decode_fused import build_decode_fused_op
+from models.fused_prefill.generated.prefill_layout import PREFILL_LAYER_WEIGHT_SPECS
+from models.fused_prefill.generated.prefill_operators import (
+    build_prefill_fused_op,
+    build_prefill_lm_head_fused_op,
+)
 from models.fused_prefill.llama_packed_weights import (
     load_llama_packed_segment,
     validate_llama_packed_weight_artifact,
 )
 from models.fused_prefill.llama_weight_layout import iter_llama_decode_weight_specs
-from models.fused_prefill.prefill_fused import (
-    build_prefill_fused_op,
-    build_prefill_lm_head_fused_op,
-)
 from models.fused_prefill.runtime_config import (
     iter_decode_variant_seq_lens,
     select_prefill_chunk_config,
@@ -171,51 +172,13 @@ def _copy_transposed_buffer(fused, name, tensor):
 def load_prefill_fused_weight_buffers(config, fused):
     for layer_idx in range(config.n_layers):
         prefix = f"model.layers.{layer_idx}"
-        _copy_buffer(
-            fused,
-            f"W_norm1_{layer_idx}",
-            config.weights[f"{prefix}.input_layernorm.weight"],
-        )
-        _copy_transposed_buffer(
-            fused,
-            f"W_attn_query_prefill_{layer_idx}",
-            config.weights[f"{prefix}.self_attn.q_proj.weight"],
-        )
-        _copy_transposed_buffer(
-            fused,
-            f"W_attn_key_prefill_{layer_idx}",
-            config.weights[f"{prefix}.self_attn.k_proj.weight"],
-        )
-        _copy_transposed_buffer(
-            fused,
-            f"W_attn_value_prefill_{layer_idx}",
-            config.weights[f"{prefix}.self_attn.v_proj.weight"],
-        )
-        _copy_transposed_buffer(
-            fused,
-            f"W_attn_output_prefill_{layer_idx}",
-            config.weights[f"{prefix}.self_attn.o_proj.weight"],
-        )
-        _copy_buffer(
-            fused,
-            f"W_norm2_{layer_idx}",
-            config.weights[f"{prefix}.post_attention_layernorm.weight"],
-        )
-        _copy_transposed_buffer(
-            fused,
-            f"W_ffn_gate_prefill_{layer_idx}",
-            config.weights[f"{prefix}.mlp.gate_proj.weight"],
-        )
-        _copy_transposed_buffer(
-            fused,
-            f"W_ffn_up_prefill_{layer_idx}",
-            config.weights[f"{prefix}.mlp.up_proj.weight"],
-        )
-        _copy_transposed_buffer(
-            fused,
-            f"W_ffn_down_prefill_{layer_idx}",
-            config.weights[f"{prefix}.mlp.down_proj.weight"],
-        )
+        for name, source_suffix, transpose in PREFILL_LAYER_WEIGHT_SPECS:
+            copy_fn = _copy_transposed_buffer if transpose else _copy_buffer
+            copy_fn(
+                fused,
+                f"{name}_{layer_idx}",
+                config.weights[f"{prefix}.{source_suffix}"],
+            )
 
     _copy_buffer(fused, "W_final_norm", config.weights["model.norm.weight"])
 

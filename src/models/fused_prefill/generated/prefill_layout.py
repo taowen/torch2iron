@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generated prefill layout constants for exported_llama3.
+"""Generated prefill layout constants for fused_prefill.
 
 Regenerate with:
     uv run python -m models.fused_prefill.codegen
@@ -36,6 +36,11 @@ PREFILL_LAYER_WEIGHT_SPECS = (
     (
         "W_attn_value_prefill",
         "self_attn.v_proj.weight",
+        True,
+    ),
+    (
+        "W_attn_output_prefill",
+        "self_attn.o_proj.weight",
         True,
     ),
     (

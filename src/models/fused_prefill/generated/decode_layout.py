@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generated decode layout constants for exported_llama3.
+"""Generated decode layout constants for fused_prefill.
 
 Regenerate with:
     uv run python -m models.fused_prefill.codegen
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 EXPECTED_DECODE_LAYERS = 16
 EXPORTED_DECODE_CHUNK_SIZE = 64
-EXPORTED_DECODE_MAX_SEQ_LEN = 512
+EXPORTED_DECODE_MAX_SEQ_LEN = 128
 
 DECODE_LAYER_INDICES = (
     0,
