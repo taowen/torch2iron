@@ -74,6 +74,21 @@ def sync_decode_packet_range(packet_cache, start_element, num_elements):
     packet_cache.device = "npu"
 
 
+def sync_decode_packet_ranges(packet_cache, ranges):
+    merged_ranges = []
+    for start, length in sorted(ranges):
+        if length <= 0:
+            continue
+        end = start + length
+        if merged_ranges and start <= merged_ranges[-1][1]:
+            merged_ranges[-1] = (merged_ranges[-1][0], max(merged_ranges[-1][1], end))
+        else:
+            merged_ranges.append((start, end))
+
+    for start, end in merged_ranges:
+        sync_decode_packet_range(packet_cache, start, end - start)
+
+
 def mark_decode_current_cache_slot(config, fused, max_seq_len, current_slot):
     for layer_idx in range(config.n_layers):
         packet_cache = fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
@@ -169,8 +184,7 @@ def sync_decode_packet_cache_slot(
             decode_packet_chunk_range(config, max_seq_len, group_idx, dst_slot)
         )
 
-    for chunk_start, chunk_elements in touched_chunks:
-        sync_decode_packet_range(packet_cache, chunk_start, chunk_elements)
+    sync_decode_packet_ranges(packet_cache, touched_chunks)
 
 
 def append_decode_kv_cache(
