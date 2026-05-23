@@ -8,6 +8,7 @@ from .gemv.op import GEMV
 from .rms_norm.op import RMSNorm
 from .rope.op import RoPE
 from .silu.op import SiLU
+from .silu_mul.op import SiLUMul
 from .softmax.op import Softmax
 from .transpose.op import Transpose
 from .strided_copy.op import StridedCopy

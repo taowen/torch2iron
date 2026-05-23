@@ -18,12 +18,11 @@ from iron.common.context import AIEContext
 from torch2iron.fusion import FusedMLIROperator
 from torch2iron.operators import (
     ElementwiseAdd,
-    ElementwiseMul,
     GEMM,
     LlamaChunkedAttention,
     RMSNorm,
     RoPE,
-    SiLU,
+    SiLUMul,
     StridedCopy,
 )
 
@@ -201,13 +200,7 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
     gemm_attn_output_op = _gemm(config, context, k=attn_dim, n=emb_dim)
     gemm_ffn_up_gate_op = _gemm(config, context, k=emb_dim, n=hidden_dim)
     gemm_ffn_down_op = _gemm(config, context, k=hidden_dim, n=emb_dim)
-    silu_ffn_op = SiLU(
-        size=ffn_elements,
-        tile_size=hidden_dim // BATCH_DECODE_COLUMNS,
-        num_aie_columns=BATCH_DECODE_COLUMNS,
-        context=context,
-    )
-    eltwise_mul_ffn_op = ElementwiseMul(
+    silu_mul_ffn_op = SiLUMul(
         size=ffn_elements,
         tile_size=hidden_dim // BATCH_DECODE_COLUMNS,
         num_aie_columns=BATCH_DECODE_COLUMNS,
@@ -346,8 +339,7 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
                     f"W_ffn_up_{layer_idx}",
                     "ffn_up",
                 ),
-                (silu_ffn_op, "ffn_gate", "ffn_gate"),
-                (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+                (silu_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
                 (
                     gemm_ffn_down_op,
                     "ffn_hidden",
