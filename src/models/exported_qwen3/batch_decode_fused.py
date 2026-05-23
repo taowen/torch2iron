@@ -18,13 +18,13 @@ from pathlib import Path
 from iron.common.context import AIEContext
 from torch2iron.fusion import FusedMLIROperator
 from torch2iron.operators import (
+    CopyPresentPacketKV,
     ElementwiseAdd,
     GEMM,
     LlamaChunkedAttention,
     RMSNorm,
     RoPE,
     SiLUMul,
-    StridedCopy,
 )
 
 from models.exported_qwen3.generated.decode_layout import (
@@ -101,33 +101,6 @@ def _gemm(config, context, *, k: int, n: int, tile_n: int | None = None) -> GEMM
         b_col_maj=False,
         separate_c_tiles=False,
         emulate_bf16_mmul_with_bfp16=False,
-        context=context,
-    )
-
-
-def _strided_copy(
-    context,
-    *,
-    input_sizes,
-    input_strides,
-    input_offset=0,
-    output_sizes,
-    output_strides,
-    output_offset=0,
-    input_buffer_size,
-    output_buffer_size,
-    num_aie_channels=1,
-):
-    return StridedCopy(
-        input_sizes=input_sizes,
-        input_strides=input_strides,
-        input_offset=input_offset,
-        output_sizes=output_sizes,
-        output_strides=output_strides,
-        output_offset=output_offset,
-        input_buffer_size=input_buffer_size,
-        output_buffer_size=output_buffer_size,
-        num_aie_channels=num_aie_channels,
         context=context,
     )
 
@@ -247,34 +220,15 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
         num_aie_columns=BATCH_DECODE_COLUMNS,
         context=context,
     )
-    copy_present_kv_op = _strided_copy(
-        context,
-        input_sizes=(n_kv_groups, head_dim),
-        input_strides=(head_dim, 1),
-        output_sizes=(n_kv_groups, head_dim),
-        output_strides=(head_dim, 1),
-        input_buffer_size=kv_dim,
-        output_buffer_size=kv_dim,
-    )
-    strided_copy_packet_key_op = _strided_copy(
-        context,
-        input_sizes=(n_kv_groups, head_dim),
-        input_strides=(head_dim, 1),
-        output_sizes=(n_kv_groups, head_dim),
-        output_strides=(packet_elements_per_group, 1),
-        output_offset=current_k_packet_offset,
-        input_buffer_size=kv_dim,
-        output_buffer_size=packet_elements,
-    )
-    strided_copy_packet_value_op = _strided_copy(
-        context,
-        input_sizes=(n_kv_groups, head_dim),
-        input_strides=(head_dim, 1),
-        output_sizes=(n_kv_groups, head_dim),
-        output_strides=(packet_elements_per_group, 1),
-        output_offset=current_v_packet_offset,
-        input_buffer_size=kv_dim,
-        output_buffer_size=packet_elements,
+    copy_present_packet_kv_op = CopyPresentPacketKV(
+        kv_dim=kv_dim,
+        num_kv_groups=n_kv_groups,
+        head_dim=head_dim,
+        packet_elements=packet_elements,
+        packet_elements_per_group=packet_elements_per_group,
+        key_packet_offset=current_k_packet_offset,
+        value_packet_offset=current_v_packet_offset,
+        context=context,
     )
     llama_chunked_attention_op = LlamaChunkedAttention(
         max_seq_len=max_seq_len,
@@ -333,17 +287,13 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
             runlist.extend(
                 [
                     (
-                        copy_present_kv_op,
+                        copy_present_packet_kv_op,
                         k_slice,
-                        _present_key_name(layer_idx, batch_idx),
-                    ),
-                    (
-                        copy_present_kv_op,
                         v_slice,
+                        _present_key_name(layer_idx, batch_idx),
                         _present_value_name(layer_idx, batch_idx),
+                        packet_name,
                     ),
-                    (strided_copy_packet_key_op, k_slice, packet_name),
-                    (strided_copy_packet_value_op, v_slice, packet_name),
                     (
                         llama_chunked_attention_op,
                         q_slice,

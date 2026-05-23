@@ -3,6 +3,7 @@
 
 from .elementwise_add.op import ElementwiseAdd
 from .elementwise_mul.op import ElementwiseMul
+from .copy_present_packet_kv.op import CopyPresentPacketKV
 from .gemm.op import GEMM
 from .gemv.op import GEMV
 from .rms_norm.op import RMSNorm

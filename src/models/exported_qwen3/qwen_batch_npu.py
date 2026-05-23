@@ -237,6 +237,7 @@ class QwenBatchNpuRunner:
             (
                 f"batch{batch_size}_decode{decode_max_seq_len}"
                 f"_chunk{DECODE_ATTN_CHUNK_SIZE}"
+                "_kvcopy2"
             ),
         )
         self.batch_fused_op = batch_op

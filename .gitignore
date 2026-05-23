@@ -20,6 +20,7 @@ build_elf/
 build_batch_elf/
 build_prefill_elf/
 build_profile_qwen3_batch_decode_ops/
+build_operator_tests/
 build_trace/
 dist/
 
