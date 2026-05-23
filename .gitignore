@@ -17,6 +17,7 @@ env/
 # Build artifacts
 build/
 build_elf/
+build_batch_elf/
 build_prefill_elf/
 dist/
 
