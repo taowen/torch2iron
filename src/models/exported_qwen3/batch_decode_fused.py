@@ -12,6 +12,7 @@ batch decode shape needed to improve NPU utilization.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from iron.common.context import AIEContext
@@ -49,6 +50,27 @@ def _slice(name: str, start_elements: int, length_elements: int) -> str:
     start = start_elements * BF16_BYTES
     end = (start_elements + length_elements) * BF16_BYTES
     return f"{name}[{start}:{end}]"
+
+
+def _trace_kwargs(build_suffix: str) -> dict:
+    trace_size = int(os.environ.get("TORCH2IRON_TRACE_SIZE", "0"))
+    if trace_size <= 0:
+        return {}
+    trace_dir = Path(os.environ.get("TORCH2IRON_TRACE_DIR", "build_trace"))
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_op_index = os.environ.get("TORCH2IRON_TRACE_OP_INDEX")
+    trace_ddr_id = os.environ.get("TORCH2IRON_TRACE_DDR_ID")
+    op_index = int(trace_op_index) if trace_op_index is not None else 0
+    ddr_id = int(trace_ddr_id) if trace_ddr_id is not None else None
+    trace_arg = ddr_id if ddr_id is not None else 3
+    trace_suffix = f"{build_suffix}.op{op_index}.arg{trace_arg}.size{trace_size}"
+    return {
+        "trace_size": trace_size,
+        "trace_file": trace_dir / f"{trace_suffix}.trace.txt",
+        "trace_json_file": trace_dir / f"{trace_suffix}.trace.json",
+        "trace_op_index": op_index,
+        "trace_ddr_id": ddr_id,
+    }
 
 
 def _batch_packet_cache_names(config, batch_size: int) -> list[str]:
@@ -126,7 +148,20 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
             f"max_seq_len must be divisible by {DECODE_ATTN_CHUNK_SIZE}"
         )
 
-    context = AIEContext(build_dir=Path("build_batch_elf") / build_suffix)
+    trace_kwargs = _trace_kwargs(build_suffix)
+    build_dir_suffix = build_suffix
+    if trace_kwargs:
+        trace_arg = trace_kwargs["trace_ddr_id"]
+        if trace_arg is None:
+            trace_arg = 3
+        build_dir_suffix = (
+            f"{build_suffix}"
+            f"_trace_op{trace_kwargs['trace_op_index']}"
+            f"_arg{trace_arg}"
+            f"_size{trace_kwargs['trace_size']}"
+        )
+
+    context = AIEContext(build_dir=Path("build_batch_elf") / build_dir_suffix)
 
     emb_dim = config.emb_dim
     hidden_dim = config.hidden_dim
@@ -396,6 +431,7 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
             },
             compile_mode="full_elf_dynamic",
             context=context,
+            **trace_kwargs,
         ).compile(),
         current_cache_slot,
     )

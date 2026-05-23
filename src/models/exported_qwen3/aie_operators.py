@@ -20,6 +20,7 @@ from models.exported_qwen3.qwen_packed_weights import (
 )
 from models.exported_qwen3.qwen_weight_layout import iter_qwen_decode_weight_specs
 from models.exported_qwen3.runtime_config import (
+    DECODE_ATTN_CHUNK_SIZE,
     iter_decode_variant_seq_lens,
     select_prefill_chunk_config,
 )
@@ -83,7 +84,7 @@ class AIEQwenOperators:
         shared_lm_head_buffer = None
 
         for variant_seq_len in self.decode.variant_seq_lens:
-            variant_suffix = f"decode{variant_seq_len}"
+            variant_suffix = f"decode{variant_seq_len}_chunk{DECODE_ATTN_CHUNK_SIZE}"
             fused_op, current_cache_slot = build_decode_fused_op(
                 config, variant_seq_len, variant_suffix
             )

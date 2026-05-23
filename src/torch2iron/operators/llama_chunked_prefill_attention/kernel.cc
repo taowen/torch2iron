@@ -42,6 +42,7 @@ static inline void update_query_state(float *__restrict q_state,
 {
     constexpr int vec_len = LLAMA_VEC_SIZE;
     float chunk_max = -__builtin_inff();
+    float scores[LLAMA_PREFILL_QUERY_LEN];
     bool has_valid = false;
 
     for (int32_t row = 0; row < rows; row++) {
@@ -56,6 +57,7 @@ static inline void update_query_state(float *__restrict q_state,
 
         float score =
             aie::reduce_add(dot.template to_vector<float>()) * LLAMA_ATTN_SCALE;
+        scores[row] = score;
         if (!has_valid || score > chunk_max) {
             chunk_max = score;
             has_valid = true;
@@ -77,17 +79,7 @@ static inline void update_query_state(float *__restrict q_state,
     }
 
     for (int32_t row = 0; row < rows; row++) {
-        aie::accum<accfloat, vec_len> dot = aie::zeros<accfloat, vec_len>();
-        const bfloat16 *__restrict k_row = k + row * head_dim;
-        for (int32_t dim = 0; dim < head_dim; dim += vec_len) {
-            aie::vector<bfloat16, vec_len> q_vec = aie::load_v<vec_len>(q + dim);
-            aie::vector<bfloat16, vec_len> k_vec =
-                aie::load_v<vec_len>(k_row + dim);
-            dot = aie::mac(dot, q_vec, k_vec);
-        }
-
-        float score =
-            aie::reduce_add(dot.template to_vector<float>()) * LLAMA_ATTN_SCALE;
+        float score = scores[row];
         float weight = exp_approx(score - new_max);
         chunk_sum += weight;
 
@@ -155,11 +147,13 @@ void llama_chunked_prefill_attention_update_past_bf16(
                 state + state_index(query, q_head, q_heads);
             float *__restrict q_acc =
                 acc + q_index(query, q_head, 0, q_heads, head_dim);
+            float scores[LLAMA_CHUNK_SIZE];
             float chunk_max = -__builtin_inff();
             bool has_valid = false;
 
             for (int32_t row = 0; row < chunk_size; row++) {
                 if (static_cast<float>(mask[row]) <= 0.5f) {
+                    scores[row] = -__builtin_inff();
                     continue;
                 }
 
@@ -177,6 +171,7 @@ void llama_chunked_prefill_attention_update_past_bf16(
                 float score =
                     aie::reduce_add(dot.template to_vector<float>()) *
                     LLAMA_ATTN_SCALE;
+                scores[row] = score;
                 if (!has_valid || score > chunk_max) {
                     chunk_max = score;
                     has_valid = true;
@@ -203,20 +198,7 @@ void llama_chunked_prefill_attention_update_past_bf16(
                     continue;
                 }
 
-                aie::accum<accfloat, vec_len> dot =
-                    aie::zeros<accfloat, vec_len>();
-                const bfloat16 *__restrict k_row = k + row * head_dim;
-                for (int32_t dim = 0; dim < head_dim; dim += vec_len) {
-                    aie::vector<bfloat16, vec_len> q_vec =
-                        aie::load_v<vec_len>(q + dim);
-                    aie::vector<bfloat16, vec_len> k_vec =
-                        aie::load_v<vec_len>(k_row + dim);
-                    dot = aie::mac(dot, q_vec, k_vec);
-                }
-
-                float score =
-                    aie::reduce_add(dot.template to_vector<float>()) *
-                    LLAMA_ATTN_SCALE;
+                float score = scores[row];
                 float weight = exp_approx(score - new_max);
                 chunk_sum += weight;
 

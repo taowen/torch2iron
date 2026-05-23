@@ -18,6 +18,7 @@ def binary_elementwise_design(
     trace_size,
     kernel_fn_name,
     kernel_obj_file,
+    trace_ddr_id=4,
     func_prefix="",
 ):
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
@@ -58,18 +59,20 @@ def binary_elementwise_design(
             of_out.release(1)
 
     # Create a worker to run the task on a compute tile (one per column)
-    my_workers = [
-        Worker(
-            core_body,
-            [
-                of_in1s[i].cons(),
-                of_in2s[i].cons(),
-                of_outs[i].prod(),
-                eltwise_kernel,
-            ],
+    my_workers = []
+    for i in range(num_columns):
+        my_workers.append(
+            Worker(
+                core_body,
+                [
+                    of_in1s[i].cons(),
+                    of_in2s[i].cons(),
+                    of_outs[i].prod(),
+                    eltwise_kernel,
+                ],
+                trace=1 if trace_size > 0 and i == 0 else None,
+            )
         )
-        for i in range(num_columns)
-    ]
 
     # Create a TensorAccessPattern for each column
     taps = [
@@ -83,8 +86,16 @@ def binary_elementwise_design(
     ]
 
     # Runtime operations to move data to/from the AIE-array
+    sequence_types = [tensor_ty, tensor_ty, tensor_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(tensor_ty, tensor_ty, tensor_ty) as (A, B, C):
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, B, C = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[my_workers[0]], ddr_id=trace_ddr_id)
         rt.start(*my_workers)
 
         tg = rt.task_group()

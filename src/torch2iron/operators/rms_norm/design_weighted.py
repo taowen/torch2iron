@@ -18,6 +18,7 @@ def my_weighted_rms_norm(
     num_channels,
     weight_length,
     trace_size,
+    trace_ddr_id=4,
     func_prefix="",
     kernel_object="rms_norm.o",
 ):
@@ -108,6 +109,7 @@ def my_weighted_rms_norm(
                         of_out1s[idx].prod(),
                         rms_norm_kernel,
                     ],
+                    trace=1 if trace_size > 0 and idx == 0 else None,
                 )
             )
     for i in range(num_columns):
@@ -141,8 +143,16 @@ def my_weighted_rms_norm(
     ]
 
     # Runtime operations to move data to/from the AIE-array
+    sequence_types = [tensor_ty, weights_ty, tensor_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(tensor_ty, weights_ty, tensor_ty) as (A, B, C):
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, B, C = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[my_workers[0]], ddr_id=trace_ddr_id)
         rt.start(*my_workers)
 
         # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.

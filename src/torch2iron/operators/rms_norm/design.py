@@ -18,6 +18,7 @@ def my_rms_norm(
     num_channels,
     tile_size,
     trace_size,
+    trace_ddr_id=4,
     func_prefix="",
     kernel_object="rms_norm.o",
 ):
@@ -68,18 +69,21 @@ def my_rms_norm(
             of_out.release(1)
 
     # Create a worker to run the task on a compute tile
-    my_workers = [
-        Worker(
-            core_body,
-            [
-                of_in1s[i * num_channels + j].cons(),
-                of_outs[i * num_channels + j].prod(),
-                rms_norm_kernel,
-            ],
-        )
-        for i in range(num_columns)
-        for j in range(num_channels)
-    ]
+    my_workers = []
+    for i in range(num_columns):
+        for j in range(num_channels):
+            idx = i * num_channels + j
+            my_workers.append(
+                Worker(
+                    core_body,
+                    [
+                        of_in1s[idx].cons(),
+                        of_outs[idx].prod(),
+                        rms_norm_kernel,
+                    ],
+                    trace=1 if trace_size > 0 and idx == 0 else None,
+                )
+            )
 
     # Create a TensorAccessPattern for each channel
     # to describe the data movement
@@ -98,8 +102,16 @@ def my_rms_norm(
     ]
 
     # Runtime operations to move data to/from the AIE-array
+    sequence_types = [tensor_ty, tensor_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(tensor_ty, tensor_ty) as (A, C):
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, C = runtime_args[:2]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[my_workers[0]], ddr_id=trace_ddr_id)
         rt.start(*my_workers)
 
         # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.

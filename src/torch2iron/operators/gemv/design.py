@@ -37,6 +37,8 @@ def my_matvec(
     kernel_object="mv.o",
     func_prefix="",
     verbose=False,
+    trace_size=0,
+    trace_ddr_id=4,
 ):
     if m_output is None:
         m_output = m_input
@@ -114,18 +116,20 @@ def my_matvec(
                 C_L1L3_fifo.release(1)
             B_L3L1_fifo.release(1)
 
-    workers = [
-        Worker(
-            core_body,
-            [
-                A_L3L1_fifos[i].cons(),
-                B_L3L1_fifos[i].cons(),
-                C_L1L3_fifos[i].prod(),
-                matvec,
-            ],
+    workers = []
+    for i in range(cols):
+        workers.append(
+            Worker(
+                core_body,
+                [
+                    A_L3L1_fifos[i].cons(),
+                    B_L3L1_fifos[i].cons(),
+                    C_L1L3_fifos[i].prod(),
+                    matvec,
+                ],
+                trace=1 if trace_size > 0 and i == 0 else None,
+            )
         )
-        for i in range(cols)
-    ]
 
     # Distribution pattern for the input matrix A: each AIE core gets a contiguous chunk of rows.
     # The input matrix in DDR is MxK-sized (row-major); each core processes (M/cols)xK-sized matrices in chunks of mxK-sized tiles.
@@ -166,8 +170,16 @@ def my_matvec(
         for col in range(cols)
     ]
 
+    sequence_types = [L3_A_ty, L3_B_ty, L3_C_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(L3_A_ty, L3_B_ty, L3_C_ty) as (A, B, C):
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, B, C = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=trace_ddr_id)
         rt.start(*workers)
         tg_b = rt.task_group()
         for col in range(cols):

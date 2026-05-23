@@ -22,6 +22,8 @@ def llama_chunked_prefill_attention(
     kernel_object="llama_chunked_prefill_attention.o",
     verbose=False,
     func_prefix="",
+    trace_size=0,
+    trace_ddr_id=4,
 ):
     if max_seq_len % chunk_size != 0:
         raise ValueError("max_seq_len must be divisible by chunk_size")
@@ -186,24 +188,26 @@ def llama_chunked_prefill_attention(
         out_fifo.release(1)
         q_current_fifo.release(1)
 
-    workers = [
-        Worker(
-            worker_body,
-            [
-                q_current_fifos[group].cons(),
-                packed_fifos[group].cons(),
-                out_fifos[group].prod(),
-                states[group],
-                accs[group],
-                init_kernel,
-                update_past_kernel,
-                update_current_kernel,
-                finalize_kernel,
-            ],
-            stack_size=0xD00,
+    workers = []
+    for group in range(logical_groups):
+        workers.append(
+            Worker(
+                worker_body,
+                [
+                    q_current_fifos[group].cons(),
+                    packed_fifos[group].cons(),
+                    out_fifos[group].prod(),
+                    states[group],
+                    accs[group],
+                    init_kernel,
+                    update_past_kernel,
+                    update_current_kernel,
+                    finalize_kernel,
+                ],
+                stack_size=0xD00,
+                trace=1 if trace_size > 0 and group == 0 else None,
+            )
         )
-        for group in range(logical_groups)
-    ]
 
     q_current_taps = [
         TensorAccessPattern(
@@ -232,12 +236,16 @@ def llama_chunked_prefill_attention(
         )
         for group in range(logical_groups)
     ]
+    sequence_types = [q_current_l3_ty, packed_l3_ty, out_l3_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(
-        q_current_l3_ty,
-        packed_l3_ty,
-        out_l3_ty,
-    ) as (q_current_l3, packed_l3, out_l3):
+    with rt.sequence(*sequence_types) as runtime_args:
+        q_current_l3, packed_l3, out_l3 = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=trace_ddr_id)
         rt.start(*workers)
         tg = rt.task_group()
         for group in range(logical_groups):

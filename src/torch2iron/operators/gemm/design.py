@@ -144,6 +144,7 @@ def my_matmul(
     prio_accuracy,
     separate_c_tiles,
     trace_size,
+    trace_ddr_id=4,
     kernel_object=None,
     func_prefix="",
     generate_taps=False,
@@ -500,6 +501,7 @@ def my_matmul(
                     ],
                     placement=Tile(tile_col, tile_row),
                     stack_size=0xD00,
+                    trace=1 if trace_size > 0 and row == 0 and col == 0 else None,
                 )
             )
 
@@ -544,9 +546,17 @@ def my_matmul(
             prune_step=False,
         )
 
+    sequence_types = [A_ty, B_ty, C_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, B, C = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=trace_ddr_id)
         rt.start(*workers)
 
         # Set runtime parameters

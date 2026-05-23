@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,8 @@ import pyxrt
 from aie import ir
 from aie.dialects import aie, aiex, memref
 from aie.extras.context import mlir_mod_ctx
+from aie.utils.trace import TraceConfig
+from aie.utils.trace.utils import get_cycles_summary
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
 from aie.utils.npukernel import NPUKernel
 from iron.common import compilation as comp
@@ -48,6 +51,34 @@ def _get_child_mlir_module(mlir_artifact: comp.PythonGeneratedMLIRArtifact) -> A
     return callback(*gen.args, **gen.kwargs)
 
 
+def _load_design_callback(generator):
+    spec = __import__("importlib.util").util.spec_from_file_location(
+        generator.source_path.name, generator.source_path
+    )
+    module = __import__("importlib.util").util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, generator.fn_name)
+
+
+def _set_design_generator_param(generator, param_name: str, value: Any) -> bool:
+    callback = _load_design_callback(generator)
+    signature = inspect.signature(callback)
+    params = list(signature.parameters)
+    if param_name not in signature.parameters:
+        return False
+    if param_name in generator.kwargs:
+        generator.kwargs[param_name] = value
+        return True
+    param_idx = params.index(param_name)
+    if param_idx < len(generator.args):
+        args = list(generator.args)
+        args[param_idx] = value
+        generator.args = tuple(args)
+    else:
+        generator.kwargs[param_name] = value
+    return True
+
+
 def _write_fused_mlir(
     *,
     filename: str,
@@ -56,7 +87,10 @@ def _write_fused_mlir(
     subbuffer_layout: dict[str, tuple[str, int, int]],
     buffer_sizes: dict[str, int],
     buffer_order: list[str],
+    runtime_buffer_order: list[str],
     slice_info: dict[str, tuple[str, int, int]],
+    trace_size: int = 0,
+    trace_arg_index: int | None = None,
 ) -> None:
     device_mlir_strings = {}
     device_ty = None
@@ -87,13 +121,25 @@ def _write_fused_mlir(
         def main():
             buf_dtype = np.dtype[ml_dtypes.bfloat16]
             itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
-            sequence_types = [
-                np.ndarray[(buffer_sizes[name] // itemsize,), buf_dtype]
-                for name in buffer_order
-            ]
+            sequence_types = []
+            for name in runtime_buffer_order:
+                if name == "trace":
+                    sequence_types.append(
+                        np.ndarray[(trace_size,), np.dtype[np.uint8]]
+                    )
+                elif name.startswith("trace_filler_"):
+                    sequence_types.append(np.ndarray[(1,), np.dtype[np.uint32]])
+                else:
+                    sequence_types.append(
+                        np.ndarray[(buffer_sizes[name] // itemsize,), buf_dtype]
+                    )
 
             def emit_sequence(runtime_buffers):
-                consolidated_buffers = dict(zip(buffer_order, runtime_buffers))
+                runtime_by_name = dict(zip(runtime_buffer_order, runtime_buffers))
+                consolidated_buffers = {
+                    name: runtime_by_name[name] for name in buffer_order
+                }
+                trace_runtime_buffer = runtime_by_name.get("trace")
                 configure_op = None
                 last_op_name = None
 
@@ -161,57 +207,23 @@ def _write_fused_mlir(
                             )
                             buffer_ssa_values.append(reinterpreted)
 
+                        if len(expected_arg_types) > len(buffer_names):
+                            if trace_runtime_buffer is None:
+                                raise ValueError(
+                                    f"{op_name} expects extra runtime args but "
+                                    "fused trace is disabled"
+                                )
+                            for _extra_type in expected_arg_types[len(buffer_names) :]:
+                                buffer_ssa_values.append(trace_runtime_buffer)
+
                         aiex.RunOp(
                             ir.FlatSymbolRefAttr.get("sequence"),
                             buffer_ssa_values,
                         )
 
-            if len(sequence_types) == 3:
-
-                @aiex.runtime_sequence(*sequence_types)
-                def sequence(input_buf, output_buf, scratch_buf):
-                    emit_sequence((input_buf, output_buf, scratch_buf))
-
-            elif len(sequence_types) == 4:
-
-                @aiex.runtime_sequence(*sequence_types)
-                def sequence(input_buf, output_buf, scratch_buf, external0):
-                    emit_sequence((input_buf, output_buf, scratch_buf, external0))
-
-            elif len(sequence_types) == 5:
-
-                @aiex.runtime_sequence(*sequence_types)
-                def sequence(input_buf, output_buf, scratch_buf, external0, external1):
-                    emit_sequence(
-                        (input_buf, output_buf, scratch_buf, external0, external1)
-                    )
-
-            elif len(sequence_types) == 6:
-
-                @aiex.runtime_sequence(*sequence_types)
-                def sequence(
-                    input_buf,
-                    output_buf,
-                    scratch_buf,
-                    external0,
-                    external1,
-                    external2,
-                ):
-                    emit_sequence(
-                        (
-                            input_buf,
-                            output_buf,
-                            scratch_buf,
-                            external0,
-                            external1,
-                            external2,
-                        )
-                    )
-
-            else:
-                raise ValueError(
-                    f"Unsupported fused runtime buffer count: {len(sequence_types)}"
-                )
+            @aiex.runtime_sequence(*sequence_types)
+            def sequence(*runtime_buffers):
+                emit_sequence(runtime_buffers)
 
     path = Path(filename)
     contents = str(ctx.module)
@@ -248,8 +260,12 @@ def _fused_mlir_signature(
     subbuffer_layout: dict[str, tuple[str, int, int]],
     buffer_sizes: dict[str, int],
     buffer_order: list[str],
+    runtime_buffer_order: list[str],
     slice_info: dict[str, tuple[str, int, int]],
     kernel_objects: list[comp.KernelObjectArtifact],
+    trace_size: int = 0,
+    trace_op_index: int | None = None,
+    trace_ddr_id: int | None = None,
 ) -> str:
     payload = {
         "fusion_source": _file_stamp(__file__),
@@ -270,7 +286,11 @@ def _fused_mlir_signature(
         "subbuffer_layout": subbuffer_layout,
         "buffer_sizes": buffer_sizes,
         "buffer_order": buffer_order,
+        "runtime_buffer_order": runtime_buffer_order,
         "slice_info": slice_info,
+        "trace_size": trace_size,
+        "trace_op_index": trace_op_index,
+        "trace_ddr_id": trace_ddr_id,
         "kernel_objects": [
             {
                 "filename": obj.filename,
@@ -310,6 +330,11 @@ class FusedMLIROperator(AIEOperatorBase):
         buffer_sizes=None,
         external_args=None,
         compile_mode="full_elf",
+        trace_size: int = 0,
+        trace_file: str | Path | None = None,
+        trace_json_file: str | Path | None = None,
+        trace_op_index: int | None = None,
+        trace_ddr_id: int | None = None,
         *args,
         **kwargs,
     ):
@@ -331,8 +356,21 @@ class FusedMLIROperator(AIEOperatorBase):
             name: list(args) for name, args in (external_args or {}).items()
         }
         self.compile_mode = compile_mode
+        self.trace_size = int(trace_size or 0)
+        self.trace_file = Path(trace_file) if trace_file is not None else None
+        self.trace_json_file = (
+            Path(trace_json_file) if trace_json_file is not None else None
+        )
+        self.trace_op_index = trace_op_index
+        self.trace_ddr_id = trace_ddr_id
         if self.compile_mode not in {"full_elf", "full_elf_dynamic", "xclbin"}:
             raise ValueError(f"unsupported fused compile mode: {self.compile_mode}")
+        if self.trace_size < 0:
+            raise ValueError("trace_size must be non-negative")
+        if self.trace_size > 0 and self.trace_arg_index < 3:
+            raise ValueError("fused trace ddr id must be >= 3")
+        if self.trace_size and self.compile_mode == "xclbin":
+            raise ValueError("fused trace capture is only wired for full ELF mode")
         reserved = {"input", "output", "scratch"}
         if reserved.intersection(self.external_args):
             raise ValueError("external_args cannot use input/output/scratch names")
@@ -340,6 +378,27 @@ class FusedMLIROperator(AIEOperatorBase):
     @property
     def buffer_order(self):
         return ["input", "output", "scratch", *self.external_args.keys()]
+
+    @property
+    def trace_arg_index(self):
+        if self.trace_size <= 0:
+            return None
+        # Full-ELF trace currently writes reliably through the fourth runtime
+        # argument. Keep trace at arg3 and shift external buffers after it.
+        return int(self.trace_ddr_id) if self.trace_ddr_id is not None else 3
+
+    @property
+    def runtime_buffer_order(self):
+        order = list(self.buffer_order)
+        if self.trace_size > 0:
+            trace_index = self.trace_arg_index
+            while len(order) < self.trace_arg_index:
+                order.append(f"trace_filler_{len(order)}")
+            if len(order) == trace_index:
+                order.append("trace")
+            else:
+                order.insert(trace_index, "trace")
+        return order
 
     def get_kernel_artifacts(self):
         kernel_artifacts = []
@@ -364,10 +423,24 @@ class FusedMLIROperator(AIEOperatorBase):
         unique_operators = [
             seen.setdefault(id(op), op) for op, *_ in self.runlist if id(op) not in seen
         ]
+        trace_idx = self.trace_op_index if self.trace_op_index is not None else 0
         for idx, op in enumerate(unique_operators):
             mlir_artifact = op.get_mlir_artifact()
             if self.compile_mode == "full_elf" and op.get_kernel_artifacts():
                 mlir_artifact.generator.kwargs["func_prefix"] = f"op{idx}_"
+            if self.trace_size > 0 and idx == trace_idx:
+                if not _set_design_generator_param(
+                    mlir_artifact.generator, "trace_size", self.trace_size
+                ):
+                    raise ValueError(
+                        f"Cannot enable trace for {op!r}: "
+                        "design has no trace_size parameter"
+                    )
+                _set_design_generator_param(
+                    mlir_artifact.generator,
+                    "trace_ddr_id",
+                    self.trace_arg_index,
+                )
             op_name = f"op{idx}_{op.__class__.__name__}"
             op_names[id(op)] = op_name
             operator_mlir_map[op_name] = mlir_artifact
@@ -482,8 +555,12 @@ class FusedMLIROperator(AIEOperatorBase):
             subbuffer_layout=self.subbuffer_layout,
             buffer_sizes=self.buffer_sizes,
             buffer_order=self.buffer_order,
+            runtime_buffer_order=self.runtime_buffer_order,
             slice_info=self.slice_info,
             kernel_objects=kernel_objects,
+            trace_size=self.trace_size,
+            trace_op_index=self.trace_op_index,
+            trace_ddr_id=self.trace_arg_index,
         )
         if not _fused_mlir_cache_valid(mlir_path, signature_path, signature):
             _write_fused_mlir(
@@ -493,7 +570,10 @@ class FusedMLIROperator(AIEOperatorBase):
                 subbuffer_layout=self.subbuffer_layout,
                 buffer_sizes=self.buffer_sizes,
                 buffer_order=self.buffer_order,
+                runtime_buffer_order=self.runtime_buffer_order,
                 slice_info=self.slice_info,
+                trace_size=self.trace_size,
+                trace_arg_index=self.trace_arg_index,
             )
             signature_path.write_text(signature + "\n")
         mlir_artifact = comp.SourceArtifact(mlir_path, available=True)
@@ -654,6 +734,27 @@ class FusedFullELFCallable(FullELFCallable):
         self.input_buffer = self._buffers["input"]
         self.output_buffer = self._buffers["output"]
         self.scratch_buffer = self._buffers["scratch"]
+        self.trace_buffer = None
+        self._trace_filler_buffers = {}
+        self.trace_config = None
+        self.trace_json_file = None
+        self.last_trace_summary = None
+        self.last_trace_error = None
+        if op.trace_size > 0:
+            self.trace_buffer = XRTTensor((op.trace_size,), dtype=np.uint8)
+            for name in op.runtime_buffer_order:
+                if name.startswith("trace_filler_"):
+                    self._trace_filler_buffers[name] = XRTTensor(
+                        (1,), dtype=np.uint32
+                    )
+            self.trace_config = TraceConfig(
+                trace_size=op.trace_size,
+                trace_file=str(op.trace_file or (op.context.build_dir / "trace.txt")),
+                ddr_id=op.trace_arg_index,
+            )
+            self.trace_json_file = Path(
+                op.trace_json_file or (op.context.build_dir / "trace.json")
+            )
         self._buffer_cache = {}
 
     def get_buffer(self, buffer_name):
@@ -683,13 +784,54 @@ class FusedFullELFCallable(FullELFCallable):
 
     def __call__(self):
         self.input_buffer.to("npu")
+        if self.trace_buffer is not None:
+            self.trace_buffer.data.fill(0)
+            self.trace_buffer.to("npu")
         super().__call__(
             *[
-                self._buffers[name].buffer_object()
-                for name in self.op.buffer_order
+                (
+                    self.trace_buffer.buffer_object()
+                    if name == "trace"
+                    else self._trace_filler_buffers[name].buffer_object()
+                    if name.startswith("trace_filler_")
+                    else self._buffers[name].buffer_object()
+                )
+                for name in self.op.runtime_buffer_order
             ]
         )
         self.output_buffer.to("cpu")
+        if self.trace_buffer is not None:
+            self._write_trace_files()
+
+    def _trace_parse_mlir_path(self) -> Path:
+        fused_mlir = Path(self.op.artifacts[0].mlir_input.filename)
+        lowered = (
+            fused_mlir.with_suffix(fused_mlir.suffix + ".prj")
+            / "input_with_addresses.mlir"
+        )
+        return lowered if lowered.exists() else fused_mlir
+
+    def _write_trace_files(self):
+        assert self.trace_buffer is not None
+        assert self.trace_config is not None
+        assert self.trace_json_file is not None
+        self.last_trace_error = None
+        self.trace_buffer.to("cpu")
+        trace_words = self.trace_buffer.data.view(np.uint32)
+        self.trace_config.write_trace(trace_words)
+        if not np.count_nonzero(trace_words):
+            self.last_trace_summary = None
+            self.last_trace_error = "empty trace buffer"
+            return
+        try:
+            self.trace_config.trace_to_json(
+                str(self._trace_parse_mlir_path()),
+                output_name=str(self.trace_json_file),
+            )
+            self.last_trace_summary = get_cycles_summary(str(self.trace_json_file))
+        except Exception as exc:
+            self.last_trace_summary = None
+            self.last_trace_error = f"{type(exc).__name__}: {exc}"
 
 
 class FusedXclbinCallable:

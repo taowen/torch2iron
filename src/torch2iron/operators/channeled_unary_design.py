@@ -20,6 +20,7 @@ def channeled_unary_design(
     kernel_fn_name,
     kernel_obj_file,
     tile_cap=4096,
+    trace_ddr_id=4,
     func_prefix="",
 ):
     xfr_dtype = bfloat16
@@ -74,19 +75,22 @@ def channeled_unary_design(
     # Large tile sizes (>4096) with LUT-based kernels need more stack space
     # than the default 1024 bytes due to spilled vector temporaries.
     worker_kwargs = {"stack_size": 0xD00} if line_size > 4096 else {}
-    my_workers = [
-        Worker(
-            core_fn,
-            [
-                of_ins[i * num_channels + j].cons(),
-                of_outs[i * num_channels + j].prod(),
-                kernel_fcn,
-            ],
-            **worker_kwargs,
-        )
-        for i in range(num_columns)
-        for j in range(num_channels)
-    ]
+    my_workers = []
+    for i in range(num_columns):
+        for j in range(num_channels):
+            idx = i * num_channels + j
+            my_workers.append(
+                Worker(
+                    core_fn,
+                    [
+                        of_ins[idx].cons(),
+                        of_outs[idx].prod(),
+                        kernel_fcn,
+                    ],
+                    trace=1 if trace_size > 0 and idx == 0 else None,
+                    **worker_kwargs,
+                )
+            )
 
     # Create a TensorAccessPattern for each channel
     taps = [
@@ -101,8 +105,16 @@ def channeled_unary_design(
     ]
 
     # Runtime operations to move data to/from the AIE-array
+    sequence_types = [transfer_type, transfer_type]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(transfer_type, transfer_type) as (a_in, b_out):
+    with rt.sequence(*sequence_types) as runtime_args:
+        a_in, b_out = runtime_args[:2]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[my_workers[0]], ddr_id=trace_ddr_id)
         rt.start(*my_workers)
 
         tg = rt.task_group()

@@ -47,6 +47,22 @@ def decode_packet_slot_offsets(
     return k_offset, v_offset, mask_offset
 
 
+def decode_packet_chunk_range(
+    config,
+    max_seq_len,
+    group_idx,
+    slot,
+    chunk_size=DECODE_ATTN_CHUNK_SIZE,
+):
+    chunk_idx = slot // chunk_size
+    chunk_elements = decode_packet_chunk_elements(config, chunk_size)
+    group_base = group_idx * decode_packet_elements_per_group(
+        config, max_seq_len, chunk_size
+    )
+    chunk_start = group_base + chunk_idx * chunk_elements
+    return chunk_start, chunk_elements
+
+
 def sync_decode_packet_range(packet_cache, start_element, num_elements):
     itemsize = packet_cache.dtype.itemsize
     sync_direction = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
@@ -141,6 +157,7 @@ def sync_decode_packet_cache_slot(
     dst_slot,
 ):
     packet = packet_cache.data
+    touched_chunks = []
     for group_idx in range(config.n_kv_groups):
         k_offset, v_offset, mask_offset = decode_packet_slot_offsets(
             config, max_seq_len, group_idx, dst_slot
@@ -148,10 +165,12 @@ def sync_decode_packet_cache_slot(
         packet[k_offset : k_offset + config.head_dim] = present_key[group_idx]
         packet[v_offset : v_offset + config.head_dim] = present_value[group_idx]
         packet[mask_offset] = 1.0
+        touched_chunks.append(
+            decode_packet_chunk_range(config, max_seq_len, group_idx, dst_slot)
+        )
 
-        sync_decode_packet_range(packet_cache, k_offset, config.head_dim)
-        sync_decode_packet_range(packet_cache, v_offset, config.head_dim)
-        sync_decode_packet_range(packet_cache, mask_offset, 1)
+    for chunk_start, chunk_elements in touched_chunks:
+        sync_decode_packet_range(packet_cache, chunk_start, chunk_elements)
 
 
 def append_decode_kv_cache(

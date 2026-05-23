@@ -47,6 +47,7 @@ from models.exported_qwen3.qwen_packed_weights import (
     validate_qwen_packed_weight_artifact,
 )
 from models.exported_qwen3.runtime_config import (
+    DECODE_ATTN_CHUNK_SIZE,
     select_compiled_seq_len,
     select_decode_context_len,
     select_prefill_chunk_config,
@@ -233,7 +234,10 @@ class QwenBatchNpuRunner:
             config,
             decode_max_seq_len,
             batch_size,
-            f"batch{batch_size}_decode{decode_max_seq_len}",
+            (
+                f"batch{batch_size}_decode{decode_max_seq_len}"
+                f"_chunk{DECODE_ATTN_CHUNK_SIZE}"
+            ),
         )
         self.batch_fused_op = batch_op
         self.batch_fused = batch_op.get_callable()

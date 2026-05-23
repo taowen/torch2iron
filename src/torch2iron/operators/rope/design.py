@@ -33,6 +33,7 @@ def rope(
     num_aie_columns=1,
     trace_size=0,
     method_type=None,
+    trace_ddr_id=4,
     func_prefix="",
 ):
     dtype = bfloat16
@@ -94,18 +95,20 @@ def rope(
             of_lut.release(1)
 
     # Create a worker to run the task on a compute tile (one per column)
-    my_workers = [
-        Worker(
-            core_body,
-            [
-                of_in[i].cons(),
-                of_lut[i].cons(),
-                of_out[i].prod(),
-                rope_kernel,
-            ],
+    my_workers = []
+    for i in range(num_aie_columns):
+        my_workers.append(
+            Worker(
+                core_body,
+                [
+                    of_in[i].cons(),
+                    of_lut[i].cons(),
+                    of_out[i].prod(),
+                    rope_kernel,
+                ],
+                trace=1 if trace_size > 0 and i == 0 else None,
+            )
         )
-        for i in range(num_aie_columns)
-    ]
 
     # This pattern chops the data into equal chunks and moves them in parallel across the columns
     tensor_taps = [
@@ -128,8 +131,16 @@ def rope(
     ]
 
     # Runtime operations to move data to/from the AIE-array
+    sequence_types = [tensor_ty, angle_ty, tensor_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(tensor_ty, angle_ty, tensor_ty) as (A, B, C):
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, B, C = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[my_workers[0]], ddr_id=trace_ddr_id)
         rt.start(*my_workers)
 
         # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.

@@ -37,6 +37,7 @@ class LlamaChunkedAttention(MLIROperator):
     q_heads_per_group: int = 4
     head_dim: int = 64
     chunk_size: int = 64
+    packed_fifo_depth: int | None = None
     kernel_vector_size: int = field(default=32, repr=False)
     context: object = field(default=None, repr=False)
 
@@ -47,6 +48,7 @@ class LlamaChunkedAttention(MLIROperator):
         "q_heads_per_group": "qhpg",
         "head_dim": "hd",
         "chunk_size": "chunk",
+        "packed_fifo_depth": "pfdepth",
     }
 
     def __post_init__(self):
@@ -64,6 +66,16 @@ class LlamaChunkedAttention(MLIROperator):
             raise ValueError("head_dim must be positive")
         if self.head_dim % self.kernel_vector_size != 0:
             raise ValueError("head_dim must be divisible by kernel_vector_size")
+        packed_object_bytes = self.packed_chunk_elements * 2
+        if self.packed_fifo_depth is None:
+            self.packed_fifo_depth = 2 if packed_object_bytes <= 24 * 1024 else 1
+        if self.packed_fifo_depth <= 0:
+            raise ValueError("packed_fifo_depth must be positive")
+        if self.packed_fifo_depth > 1 and packed_object_bytes > 24 * 1024:
+            raise ValueError(
+                "packed_fifo_depth > 1 requires smaller attention chunks; "
+                f"one packed chunk is {packed_object_bytes} bytes"
+            )
         MLIROperator.__init__(self, context=self.context)
 
     @property
@@ -120,6 +132,7 @@ class LlamaChunkedAttention(MLIROperator):
                 {
                     "verbose": mlir_verbose,
                     "kernel_object": self._kernel_object_name,
+                    "packed_fifo_depth": self.packed_fifo_depth,
                 },
             ),
         )

@@ -22,6 +22,9 @@ def llama_chunked_attention(
     kernel_object="llama_chunked_attention.o",
     verbose=False,
     func_prefix="",
+    trace_size=0,
+    trace_ddr_id=4,
+    packed_fifo_depth=1,
 ):
     if max_seq_len % chunk_size != 0:
         raise ValueError("max_seq_len must be divisible by chunk_size")
@@ -31,6 +34,8 @@ def llama_chunked_attention(
         raise ValueError("q_heads_per_group must be positive")
     if head_dim <= 0:
         raise ValueError("head_dim must be positive")
+    if packed_fifo_depth <= 0:
+        raise ValueError("packed_fifo_depth must be positive")
     if verbose:
         print(
             "llama_chunked_attention: "
@@ -90,7 +95,7 @@ def llama_chunked_attention(
         ObjectFifo(
             packed_chunk_ty,
             name=f"llama_attn_packed_kv_chunks_g{group}",
-            depth=1,
+            depth=packed_fifo_depth,
         )
         for group in range(num_kv_groups)
     ]
@@ -143,23 +148,25 @@ def llama_chunked_attention(
         out_fifo.release(1)
         q_fifo.release(1)
 
-    workers = [
-        Worker(
-            worker_body,
-            [
-                q_fifos[group].cons(),
-                packed_fifos[group].cons(),
-                out_fifos[group].prod(),
-                states[group],
-                accs[group],
-                init_kernel,
-                update_kernel,
-                finalize_kernel,
-            ],
-            stack_size=0xD00,
+    workers = []
+    for group in range(num_kv_groups):
+        workers.append(
+            Worker(
+                worker_body,
+                [
+                    q_fifos[group].cons(),
+                    packed_fifos[group].cons(),
+                    out_fifos[group].prod(),
+                    states[group],
+                    accs[group],
+                    init_kernel,
+                    update_kernel,
+                    finalize_kernel,
+                ],
+                stack_size=0xD00,
+                trace=1 if trace_size > 0 and group == 0 else None,
+            )
         )
-        for group in range(num_kv_groups)
-    ]
 
     q_taps = [
         TensorAccessPattern(
@@ -180,8 +187,16 @@ def llama_chunked_attention(
         for group in range(num_kv_groups)
     ]
 
+    sequence_types = [q_l3_ty, packed_l3_ty, out_l3_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
     rt = Runtime()
-    with rt.sequence(q_l3_ty, packed_l3_ty, out_l3_ty) as (q_l3, packed_l3, out_l3):
+    with rt.sequence(*sequence_types) as runtime_args:
+        q_l3, packed_l3, out_l3 = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=trace_ddr_id)
         rt.start(*workers)
         tg = rt.task_group()
         for group in range(num_kv_groups):
