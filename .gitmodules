@@ -1,0 +1,4 @@
+[submodule "third_party/IRON"]
+	path = third_party/IRON
+	url = https://github.com/amd/IRON.git
+	branch = devel
