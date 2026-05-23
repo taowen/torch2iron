@@ -128,6 +128,9 @@ def generate_token(config, forward_pass, state):
     # Step 2: Get logits for last token
     last_token_logits = logits[:, -1, :]  # (batch, vocab_size)
 
+    if config.temperature <= 0 or config.top_k == 1:
+        return torch.argmax(last_token_logits, dim=-1).item(), state
+
     # Step 3: Temperature scaling
     if config.temperature > 0:
         last_token_logits = last_token_logits / config.temperature

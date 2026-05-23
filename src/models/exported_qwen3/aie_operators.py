@@ -13,10 +13,7 @@ from torch2iron.fusion import FusedFullELFCallable
 
 from models.exported_qwen3.generated.decode_fused import build_decode_fused_op
 from models.exported_qwen3.generated.prefill_layout import PREFILL_LAYER_WEIGHT_SPECS
-from models.exported_qwen3.generated.prefill_operators import (
-    build_prefill_fused_op,
-    build_prefill_lm_head_fused_op,
-)
+from models.exported_qwen3.generated.prefill_operators import build_prefill_fused_op
 from models.exported_qwen3.qwen_packed_weights import (
     load_qwen_packed_segment,
     validate_qwen_packed_weight_artifact,
@@ -73,17 +70,10 @@ class AIEQwenOperators:
         )
         self.prefill.fused = self.prefill.fused_op.get_callable()
 
-        self.prefill.lm_head_op = build_prefill_lm_head_fused_op(
-            config, prefill_build_suffix
-        )
-        self.prefill.lm_head = self.prefill.lm_head_op.get_callable()
-
         load_prefill_fused_weight_buffers(config, self.prefill.fused)
         self.prefill.fused.weight_buffer.to("npu")
         self.prefill.fused.scratch_buffer.to("npu")
         self.prefill.fused.output_buffer.to("npu")
-        load_prefill_lm_head_weight_buffer(config, self.prefill.lm_head)
-        self.prefill.lm_head.lm_head_buffer.to("npu")
 
     def _build_decode_ops(self, config, prompt_len, build_suffix, *, prefill_seq_len):
         self.decode.variant_seq_lens = iter_decode_variant_seq_lens(prompt_len)
@@ -166,10 +156,3 @@ def load_prefill_fused_weight_buffers(config, fused):
             )
 
     _copy_buffer(fused, "W_final_norm", config.weights["model.norm.weight"])
-
-
-def load_prefill_lm_head_weight_buffer(config, fused):
-    fused.get_buffer("W_out_head").torch_view().view(
-        config.vocab_size,
-        config.emb_dim,
-    )[:] = config.weights[config.lm_head_weight_source]

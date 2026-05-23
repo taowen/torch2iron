@@ -41,12 +41,35 @@ from models.exported_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 def _decode_lm_head_tile_size_output(config) -> int:
     rows_per_column = config.vocab_size // 8
-    for tile_size_output in (32, 16, 8, 4):
+    preferred_tile_sizes = (
+        (8, 16, 4, 32) if config.head_dim >= 128 else (32, 16, 8, 4)
+    )
+    for tile_size_output in preferred_tile_sizes:
         if rows_per_column % tile_size_output == 0:
             return tile_size_output
     raise ValueError(
         "decode lm_head vocab rows per AIE column must be divisible by 4, 8, 16, or 32"
     )
+
+
+def _decode_attn_key_value_tile_size_input(config) -> int:
+    return 8 if config.head_dim >= 128 else 4
+
+
+def _decode_attn_key_value_tile_size_output(config) -> int:
+    return config.head_dim if config.head_dim >= 128 else config.head_dim // 2
+
+
+def _decode_attn_output_tile_size_input(config) -> int:
+    return 2 if config.head_dim >= 128 else 4
+
+
+def _decode_ffn_up_gate_tile_size_input(config) -> int:
+    return 2 if config.head_dim >= 128 else 4
+
+
+def _decode_lm_head_tile_size_input(config) -> int:
+    return 8 if config.head_dim >= 128 else 4
 
 
 def build_decode_fused_op(config, prompt_len, build_suffix):
@@ -76,8 +99,8 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         M=config.n_kv_groups * config.head_dim,
         K=config.emb_dim,
         num_aie_columns=8,
-        tile_size_input=4,
-        tile_size_output=config.head_dim // 2,
+        tile_size_input=_decode_attn_key_value_tile_size_input(config),
+        tile_size_output=_decode_attn_key_value_tile_size_output(config),
         context=elf_ctx,
     )
 
@@ -181,7 +204,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         M=config.emb_dim,
         K=config.n_heads * config.head_dim,
         num_aie_columns=8,
-        tile_size_input=4,
+        tile_size_input=_decode_attn_output_tile_size_input(config),
         tile_size_output=config.emb_dim // 8,
         context=elf_ctx,
     )
@@ -199,7 +222,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         M=config.hidden_dim,
         K=config.emb_dim,
         num_aie_columns=8,
-        tile_size_input=4,
+        tile_size_input=_decode_ffn_up_gate_tile_size_input(config),
         tile_size_output=config.hidden_dim // 8,
         context=elf_ctx,
     )
@@ -237,7 +260,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         M=config.vocab_size,
         K=config.emb_dim,
         num_aie_columns=8,
-        tile_size_input=4,
+        tile_size_input=_decode_lm_head_tile_size_input(config),
         tile_size_output=_decode_lm_head_tile_size_output(config),
         context=elf_ctx,
     )

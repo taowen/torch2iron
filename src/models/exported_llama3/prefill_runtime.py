@@ -66,17 +66,10 @@ def _append_prefill_chunk_to_packet_cache(
 
 def _run_lm_head_for_last_chunk(runner, hidden_out, valid_len):
     config = runner.config
-    lm_head = runner.aie_ops.prefill.lm_head
-
-    x = lm_head.get_buffer("x").torch_view().view(config.emb_dim)
-    x[:] = hidden_out[valid_len - 1, :]
-
-    lm_head()
-    return lm_head.get_buffer("logits").torch_view().view(
-        1,
-        1,
-        config.vocab_size,
-    )
+    source = getattr(config, "lm_head_weight_source", "model.embed_tokens.weight")
+    weight = config.weights[source]
+    x = hidden_out[valid_len - 1, :].to(dtype=weight.dtype)
+    return torch.mv(weight, x).view(1, 1, config.vocab_size)
 
 
 def prefill_forward_pass(runner, state):

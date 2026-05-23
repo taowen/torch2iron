@@ -93,6 +93,9 @@ def generate_token(config, forward_pass, state):
     logits, state = forward_pass(config, state)
     last_token_logits = logits[:, -1, :]
 
+    if config.temperature <= 0 or config.top_k == 1:
+        return torch.argmax(last_token_logits, dim=-1).item(), state
+
     if config.temperature > 0:
         last_token_logits = last_token_logits / config.temperature
 
