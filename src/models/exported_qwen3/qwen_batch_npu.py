@@ -182,26 +182,32 @@ def _copy_prefill_packet_cache_to_batch(
         dst_packet.zero_()
 
         for group_idx in range(config.n_kv_groups):
-            for slot in range(valid_tokens):
+            copied_tokens = 0
+            while copied_tokens < valid_tokens:
+                rows = min(DECODE_ATTN_CHUNK_SIZE, valid_tokens - copied_tokens)
                 src_k_offset, src_v_offset, src_mask_offset = decode_packet_slot_offsets(
                     config,
                     prefill_max_seq_len,
                     group_idx,
-                    slot,
+                    copied_tokens,
                 )
                 dst_k_offset, dst_v_offset, dst_mask_offset = decode_packet_slot_offsets(
                     config,
                     batch_max_seq_len,
                     group_idx,
-                    slot,
+                    copied_tokens,
                 )
+                kv_elements = rows * config.head_dim
                 dst_packet[
-                    dst_k_offset : dst_k_offset + config.head_dim
-                ] = src_packet[src_k_offset : src_k_offset + config.head_dim]
+                    dst_k_offset : dst_k_offset + kv_elements
+                ] = src_packet[src_k_offset : src_k_offset + kv_elements]
                 dst_packet[
-                    dst_v_offset : dst_v_offset + config.head_dim
-                ] = src_packet[src_v_offset : src_v_offset + config.head_dim]
-                dst_packet[dst_mask_offset] = src_packet[src_mask_offset]
+                    dst_v_offset : dst_v_offset + kv_elements
+                ] = src_packet[src_v_offset : src_v_offset + kv_elements]
+                dst_packet[
+                    dst_mask_offset : dst_mask_offset + rows
+                ] = src_packet[src_mask_offset : src_mask_offset + rows]
+                copied_tokens += rows
 
             _, _, current_mask_offset = decode_packet_slot_offsets(
                 config,
