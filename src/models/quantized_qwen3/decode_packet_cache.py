@@ -5,11 +5,6 @@
 
 from aie.utils.hostruntime.xrtruntime.tensor import xrt as pyxrt
 
-from models.quantized_qwen3.generated.decode_layout import (
-    DECODE_PACKET_CACHE_NAMES,
-    DECODE_PRESENT_KEY_NAMES,
-    DECODE_PRESENT_VALUE_NAMES,
-)
 from models.quantized_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
@@ -89,86 +84,6 @@ def sync_decode_packet_ranges(packet_cache, ranges):
         sync_decode_packet_range(packet_cache, start, end - start)
 
 
-def mark_decode_current_cache_slot(config, fused, max_seq_len, current_slot):
-    for layer_idx in range(config.n_layers):
-        packet_cache = fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
-        packet = packet_cache.torch_view()
-        for group_idx in range(config.n_kv_groups):
-            _, _, mask_offset = decode_packet_slot_offsets(
-                config,
-                max_seq_len,
-                group_idx,
-                current_slot,
-            )
-            packet[mask_offset] = 1.0
-            sync_decode_packet_range(packet_cache, mask_offset, 1)
-
-
-def copy_decode_packet_cache_tokens(
-    config,
-    src_fused,
-    src_max_seq_len,
-    dst_fused,
-    dst_max_seq_len,
-    valid_tokens,
-    dst_current_slot,
-    *,
-    sync_src_from_npu=False,
-):
-    if valid_tokens > min(src_max_seq_len, dst_max_seq_len):
-        raise ValueError(
-            f"cannot copy {valid_tokens} KV tokens from seq{src_max_seq_len} "
-            f"to seq{dst_max_seq_len}"
-        )
-
-    for layer_idx in range(config.n_layers):
-        src_cache = src_fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
-        dst_cache = dst_fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
-        if sync_src_from_npu:
-            src_cache.to("cpu")
-        src_packet = src_cache.torch_view()
-        dst_packet = dst_cache.torch_view()
-        dst_packet.zero_()
-
-        for group_idx in range(config.n_kv_groups):
-            copied_tokens = 0
-            while copied_tokens < valid_tokens:
-                rows = min(DECODE_ATTN_CHUNK_SIZE, valid_tokens - copied_tokens)
-                src_k_offset, src_v_offset, src_mask_offset = decode_packet_slot_offsets(
-                    config,
-                    src_max_seq_len,
-                    group_idx,
-                    copied_tokens,
-                )
-                dst_k_offset, dst_v_offset, dst_mask_offset = decode_packet_slot_offsets(
-                    config,
-                    dst_max_seq_len,
-                    group_idx,
-                    copied_tokens,
-                )
-                kv_elements = rows * config.head_dim
-                dst_packet[
-                    dst_k_offset : dst_k_offset + kv_elements
-                ] = src_packet[src_k_offset : src_k_offset + kv_elements]
-                dst_packet[
-                    dst_v_offset : dst_v_offset + kv_elements
-                ] = src_packet[src_v_offset : src_v_offset + kv_elements]
-                dst_packet[
-                    dst_mask_offset : dst_mask_offset + rows
-                ] = src_packet[src_mask_offset : src_mask_offset + rows]
-                copied_tokens += rows
-
-            _, _, current_mask_offset = decode_packet_slot_offsets(
-                config,
-                dst_max_seq_len,
-                group_idx,
-                dst_current_slot,
-            )
-            dst_packet[current_mask_offset] = 1.0
-
-        dst_cache.to("npu")
-
-
 def sync_decode_packet_cache_slot(
     config,
     max_seq_len,
@@ -191,37 +106,3 @@ def sync_decode_packet_cache_slot(
         )
 
     sync_decode_packet_ranges(packet_cache, touched_chunks)
-
-
-def append_decode_kv_cache(
-    config,
-    fused,
-    max_seq_len,
-    current_cache_slot,
-    num_preceding_tokens,
-):
-    current_slot = current_cache_slot
-    dst_slot = num_preceding_tokens
-    if dst_slot == current_slot:
-        return
-
-    for layer_idx in range(config.n_layers):
-        present_key = (
-            fused.get_buffer(DECODE_PRESENT_KEY_NAMES[layer_idx])
-            .data
-            .reshape(config.n_kv_groups, config.head_dim)
-        )
-        present_value = (
-            fused.get_buffer(DECODE_PRESENT_VALUE_NAMES[layer_idx])
-            .data
-            .reshape(config.n_kv_groups, config.head_dim)
-        )
-        packet_cache = fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
-        sync_decode_packet_cache_slot(
-            config,
-            max_seq_len,
-            packet_cache,
-            present_key,
-            present_value,
-            dst_slot,
-        )

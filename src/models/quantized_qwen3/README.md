@@ -50,10 +50,12 @@ qwen3_w4a16_packed/
 This is the runtime format. It is aligned and stores each Linear in two layouts.
 The row-major `qparam` layout is used by GEMV decode: each output row stores
 biased signed-int4 packed along K followed by that row's bf16 group scales. The
-column-stream `gemm_weight` layout is used by fused prefill GEMM:
-`(num_aie_columns, n_tile_groups, k_tiles, tile_n, tile_k)`. It stores bf16
-weights that were dequantized once during packing, so the AIE prefill kernel
-does not spend its inner loop on qparam unpack, bias subtraction, or scaling.
+column-stream `gemm_weight` layout is used by fused GEMM:
+`(num_aie_columns, n_tile_groups, k_tiles, tile_k // 8, tile_n // 8, 8, 8)`.
+It stores bf16 weights that were dequantized once during packing and arranged
+in the `s x t` subtile order consumed by `aie::mmul<4,8,8>`, so the AIE kernel
+does not spend its inner loop on qparam unpack, bias subtraction, scaling, or
+weight transposition.
 Dense non-Linear weights are stored as contiguous bf16 segments in the same
 binary. The AutoGPTQ safetensors remain useful only as an offline import/debug
 format; inference requires `qwen3_w4a16_packed`.
@@ -84,14 +86,16 @@ supported inference format in this directory.
 uv run python -m models.quantized_qwen3.qwen_npu \
   ~/models/qwen3-0.6b-w4a16-autogptq \
   --prompt-len 64 \
-  --num-tokens 8
+  --num-tokens 8 \
+  --batch-size 2
 ```
 
-The NPU runtime is copied from `exported_qwen3` and specialized in this
-directory. Decode Linear ops, including `lm_head`, use `W4A16GEMV` with one
-`uint8` qparam external buffer per Linear. Prefill transformer Linear ops use
-`W4A16GEMM` over the pre-dequantized `gemm_weight` tile stream, so the prefill
-path does not build temporary dense bf16 Linear weights on the host and does not
-dequantize qparam inside the AIE hot loop. The current GEMM kernel still uses a
-vector dot/reduce structure; a future tiled `aie::mmul` path would need the
-offline layout to match the AIE API's `s x t` subtile order.
+The NPU runtime uses one batch transformer decode path for both single-request
+and multi-request inference. Transformer decode Linear ops use padded-row
+`W4A16GEMM` over the pre-dequantized `gemm_weight` tile stream. Decode chooses
+4/8/16/32 padded rows from the requested batch size, so decode uses the same
+batch code path while satisfying the `aie::mmul` tile shape. The `lm_head` uses
+a batch `W4A16GEMV` that shares one `uint8` qparam buffer across all active
+batch lanes, avoiding qparam replication while keeping the generated IR small.
+Prefill transformer Linear ops also use `W4A16GEMM`, so the hot paths do not
+build temporary dense bf16 Linear weights on the host.

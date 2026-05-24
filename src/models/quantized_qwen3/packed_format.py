@@ -31,7 +31,7 @@ import safetensors.torch
 import torch
 
 
-PACKED_FORMAT = "quantized_qwen3_w4a16_inference_v5"
+PACKED_FORMAT = "quantized_qwen3_w4a16_inference_v9"
 PACKED_DIRNAME = "qwen3_w4a16_packed"
 PACKED_MANIFEST = "manifest.json"
 PACKED_DATA = "weights.w4a16.bin"
@@ -291,11 +291,12 @@ def make_gemm_bf16_tile(
     tile_n: int = 64,
     num_aie_columns: int = 8,
 ) -> torch.Tensor:
-    """Pack pre-dequantized bf16 B tiles for the fused prefill GEMM.
+    """Pack pre-dequantized bf16 B tiles for the fused GEMM.
 
-    Decode still consumes the compact W4 qparam layout. Prefill is throughput
-    sensitive enough that it is worth storing a second, tile-major bf16 view so
-    the AIE kernel can skip qparam unpack/dequant in the inner loop.
+    The AIE kernel consumes each ``(tile_k, tile_n)`` B tile as
+    ``(tile_k // 8, tile_n // 8, 8, 8)``. That is the natural ``s x t``
+    subtile order for ``aie::mmul<4,8,8>`` and avoids transposing the weight
+    tile at runtime.
     """
 
     if tile_k != group_size:
@@ -311,6 +312,12 @@ def make_gemm_bf16_tile(
         raise ValueError(
             f"out_features ({out_features}) must be divisible by tile_n ({tile_n})"
         )
+    mmul_s = 8
+    mmul_t = 8
+    if tile_k % mmul_s != 0:
+        raise ValueError(f"tile_k ({tile_k}) must be divisible by {mmul_s}")
+    if tile_n % mmul_t != 0:
+        raise ValueError(f"tile_n ({tile_n}) must be divisible by {mmul_t}")
 
     packed = packed.detach().cpu().to(torch.uint8).contiguous()
     low = torch.bitwise_and(packed, 0x0F)
@@ -328,7 +335,15 @@ def make_gemm_bf16_tile(
         )
     n_tile_groups = n_tiles // num_aie_columns
     tiled = torch.empty(
-        (num_aie_columns, n_tile_groups, k_tiles, tile_n, tile_k),
+        (
+            num_aie_columns,
+            n_tile_groups,
+            k_tiles,
+            tile_k // mmul_s,
+            tile_n // mmul_t,
+            mmul_s,
+            mmul_t,
+        ),
         dtype=torch.bfloat16,
     )
 
@@ -344,7 +359,17 @@ def make_gemm_bf16_tile(
                     signed[row_start:row_end, k_start:k_end]
                     * scales_f32[row_start:row_end, k_tile].view(tile_n, 1)
                 )
-                tiled[col, n_group, k_tile] = tile.to(torch.bfloat16)
+                row_major_b = tile.t().contiguous().to(torch.bfloat16)
+                tiled[col, n_group, k_tile] = (
+                    row_major_b.view(
+                        tile_k // mmul_s,
+                        mmul_s,
+                        tile_n // mmul_t,
+                        mmul_t,
+                    )
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
 
     return tiled.contiguous()
 
@@ -464,18 +489,7 @@ def write_packed_inference_artifact(
 
             qparam = make_qparam(packed, scales_out_major)
             qparam_offset, qparam_length = _write_bytes(f, _uint8_bytes(qparam))
-            gemm_weight = make_gemm_bf16_tile(
-                packed,
-                scales_out_major,
-                in_features=in_features,
-                out_features=out_features,
-                group_size=group_size,
-            )
-            gemm_weight_offset, gemm_weight_length = _write_bytes(
-                f,
-                _bf16_bytes(gemm_weight),
-            )
-            manifest["linears"][prefix] = {
+            linear_entry = {
                 "name": prefix,
                 "in_features": in_features,
                 "out_features": out_features,
@@ -491,7 +505,21 @@ def write_packed_inference_artifact(
                     byte_length=qparam_length,
                     layout="out_major_qweight_then_bf16_scales",
                 ),
-                "gemm_weight": _segment(
+                "zero_bias": 8,
+            }
+            if prefix != "lm_head":
+                gemm_weight = make_gemm_bf16_tile(
+                    packed,
+                    scales_out_major,
+                    in_features=in_features,
+                    out_features=out_features,
+                    group_size=group_size,
+                )
+                gemm_weight_offset, gemm_weight_length = _write_bytes(
+                    f,
+                    _bf16_bytes(gemm_weight),
+                )
+                linear_entry["gemm_weight"] = _segment(
                     name=f"{prefix}.gemm_tile_bf16_weight",
                     role="linear_gemm_tile_bf16_weight",
                     source=f"{prefix}.qweight",
@@ -499,15 +527,14 @@ def write_packed_inference_artifact(
                     dtype="bfloat16",
                     byte_offset=gemm_weight_offset,
                     byte_length=gemm_weight_length,
-                    layout="col_major_n_group_k_tile_tile_n_tile_k_bf16",
-                ),
-                "gemm_tile": {
+                    layout="col_major_n_group_k_tile_kblock_nblock_s_t_bf16_mmul",
+                )
+                linear_entry["gemm_tile"] = {
                     "tile_k": 128,
                     "tile_n": 64,
                     "num_aie_columns": 8,
-                },
-                "zero_bias": 8,
-            }
+                }
+            manifest["linears"][prefix] = linear_entry
         if "lm_head" not in manifest["linears"]:
             lm_source = "lm_head.weight" if "lm_head.weight" in tensors else "model.embed_tokens.weight"
             if lm_source in tensors:

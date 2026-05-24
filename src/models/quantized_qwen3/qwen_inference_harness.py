@@ -137,6 +137,19 @@ def parse_args():
     )
     parser.add_argument("--prompt-len", type=int, default=2048)
     parser.add_argument("--num-tokens", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        default=None,
+        help="Prompt text for one batch lane. Repeat exactly --batch-size times.",
+    )
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default=None,
+        help="Text file with one prompt per line. Must contain exactly --batch-size prompts.",
+    )
     return parser.parse_args()
 
 

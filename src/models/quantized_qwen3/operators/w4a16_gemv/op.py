@@ -28,6 +28,7 @@ class W4A16GEMV(MLIROperator):
     tile_size_input: int = 2
     tile_size_output: int | None = None
     num_batches: int = 1
+    shared_qparam: bool = False
     group_size: int = 128
     kernel_vector_size: int = field(default=32, repr=False)
     context: object = field(default=None, repr=False)
@@ -38,6 +39,7 @@ class W4A16GEMV(MLIROperator):
         "tile_size_input": "tsi",
         "tile_size_output": "tso",
         "num_batches": "batch",
+        "shared_qparam": "sharedqp",
         "group_size": "g",
     }
 
@@ -85,6 +87,7 @@ class W4A16GEMV(MLIROperator):
                     self.tile_size_input,
                     self.tile_size_output,
                     self.num_batches,
+                    self.shared_qparam,
                 ),
                 {
                     "verbose": mlir_verbose,
@@ -111,10 +114,11 @@ class W4A16GEMV(MLIROperator):
 
     def get_arg_spec(self):
         batch_dim = (self.num_batches,) if self.num_batches > 1 else ()
+        qparam_dim = () if self.shared_qparam else batch_dim
         return [
             AIERuntimeArgSpec(
                 "in",
-                batch_dim + (self.M, self.qparam_row_bytes),
+                qparam_dim + (self.M, self.qparam_row_bytes),
                 dtype=np.uint8,
             ),
             AIERuntimeArgSpec("in", batch_dim + (self.K,), dtype=bfloat16),

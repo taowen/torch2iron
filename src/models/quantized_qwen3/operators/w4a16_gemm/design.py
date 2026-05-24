@@ -39,6 +39,12 @@ def my_w4a16_gemm(
     assert K % tile_k == 0
     assert N % (tile_n * cols) == 0
     assert tile_k % 2 == 0
+    mmul_r = 4
+    mmul_s = 8
+    mmul_t = 8
+    assert tile_m == mmul_r or tile_m % (2 * mmul_r) == 0
+    assert tile_k % mmul_s == 0
+    assert tile_n % (2 * mmul_t) == 0
 
     k_tiles = K // tile_k
     m_tile_groups = M // (tile_m * rows)
@@ -47,13 +53,16 @@ def my_w4a16_gemm(
     bf16_dtype = np.dtype[bfloat16]
 
     L1_A_ty = np.ndarray[(tile_m, tile_k), bf16_dtype]
-    L1_QP_ty = np.ndarray[(tile_n, tile_k), bf16_dtype]
+    L1_QP_ty = np.ndarray[
+        (tile_k // mmul_s, tile_n // mmul_t, mmul_s, mmul_t),
+        bf16_dtype,
+    ]
     L1_C_ty = np.ndarray[(tile_m, tile_n), bf16_dtype]
     L2_C_ty = np.ndarray[(rows * tile_m, tile_n), bf16_dtype]
 
     L3_A_ty = np.ndarray[(M, K), bf16_dtype]
     L3_QP_ty = np.ndarray[
-        (cols, n_tile_groups, k_tiles, tile_n, tile_k),
+        (cols, n_tile_groups, k_tiles, tile_k // mmul_s, tile_n // mmul_t, mmul_s, mmul_t),
         bf16_dtype,
     ]
     L3_C_ty = np.ndarray[(M, N), bf16_dtype]
@@ -72,6 +81,12 @@ def my_w4a16_gemm(
             obj_type=L1_A_ty,
             name=f"A_L2L1_{row}",
             depth=2,
+            dims_to_stream=[
+                (tile_m // mmul_r, mmul_r * tile_k),
+                (tile_k // mmul_s, mmul_s),
+                (mmul_r, tile_k),
+                (mmul_s, 1),
+            ],
             placement=Tile(row * 2 if cols == 8 else row, 1),
         )
         for row in range(rows)
@@ -90,7 +105,18 @@ def my_w4a16_gemm(
         for col in range(cols)
     ]
     C_L2L3 = [
-        ObjectFifo(L2_C_ty, name=f"C_L2L3_{col}", depth=2) for col in range(cols)
+        ObjectFifo(
+            L2_C_ty,
+            name=f"C_L2L3_{col}",
+            depth=2,
+            dims_to_stream=[
+                (tile_m // mmul_r, mmul_r * tile_n),
+                (mmul_r, mmul_t),
+                (tile_n // mmul_t, mmul_r * mmul_t),
+                (mmul_t, 1),
+            ],
+        )
+        for col in range(cols)
     ]
     C_L1L2 = [
         C_L2L3[col]

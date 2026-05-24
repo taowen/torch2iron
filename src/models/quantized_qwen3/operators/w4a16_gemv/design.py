@@ -21,6 +21,7 @@ def my_w4a16_matvec(
     m_input,
     m_output=None,
     num_batches=1,
+    shared_qparam=False,
     kernel_object="w4a16_gemv.o",
     func_prefix="",
     verbose=False,
@@ -30,7 +31,10 @@ def my_w4a16_matvec(
     if m_output is None:
         m_output = m_input
     if verbose:
-        print(f"W4A16 GEMV: M={M}, K={K}, group={group_size}, cols={cols}")
+        print(
+            f"W4A16 GEMV: M={M}, K={K}, group={group_size}, cols={cols}, "
+            f"batch={num_batches}, shared_qparam={shared_qparam}"
+        )
 
     assert M % cols == 0
     assert K % 2 == 0
@@ -50,7 +54,8 @@ def my_w4a16_matvec(
     L1_X_ty = np.ndarray[(K,), bf16_dtype]
     L1_Y_ty = np.ndarray[(m_output,), bf16_dtype]
 
-    L3_QP_ty = np.ndarray[(num_batches * M * qparam_row_bytes,), np.dtype[qweight_dtype]]
+    qparam_batches = 1 if shared_qparam else num_batches
+    L3_QP_ty = np.ndarray[(qparam_batches * M * qparam_row_bytes,), np.dtype[qweight_dtype]]
     L3_X_ty = np.ndarray[(num_batches * K,), bf16_dtype]
     L3_Y_ty = np.ndarray[(num_batches * M,), bf16_dtype]
 
@@ -95,7 +100,10 @@ def my_w4a16_matvec(
         [
             TensorAccessPattern(
                 tensor_dims=L3_QP_ty.__args__[0],
-                offset=col * (M // cols) * qparam_row_bytes + batch * M * qparam_row_bytes,
+                offset=(
+                    col * (M // cols) * qparam_row_bytes
+                    + (0 if shared_qparam else batch * M * qparam_row_bytes)
+                ),
                 sizes=[1, 1, 1, (M // cols) * qparam_row_bytes],
                 strides=[0, 0, 0, 1],
             )

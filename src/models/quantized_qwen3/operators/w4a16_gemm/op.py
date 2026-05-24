@@ -20,14 +20,13 @@ from iron.common import (
 
 @dataclass
 class W4A16GEMM(MLIROperator):
-    """AIE prefill matrix-matrix multiply over offline dequantized W4A16 tiles.
+    """AIE matrix-matrix multiply over offline dequantized W4A16 tiles.
 
     The B/weight input uses the column-stream ``gemm_weight`` layout produced by
     ``models.quantized_qwen3.packed_format.make_gemm_bf16_tile``:
     ``(num_aie_columns, N // (tile_n * num_aie_columns), K // tile_k,
-    tile_n, tile_k)``. Decode still uses the compact W4 qparam layout; this
-    prefill-only format spends disk space to remove qparam unpack/dequant from
-    the GEMM inner loop.
+    tile_k // 8, tile_n // 8, 8, 8)``. Each B tile is pre-dequantized and
+    stored in the ``s x t`` subtile order consumed by ``aie::mmul<4,8,8>``.
     """
 
     M: int
@@ -39,7 +38,6 @@ class W4A16GEMM(MLIROperator):
     tile_k: int = 128
     tile_n: int = 64
     group_size: int = 128
-    kernel_vector_size: int = field(default=32, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -61,15 +59,17 @@ class W4A16GEMM(MLIROperator):
             raise ValueError("K must be a multiple of tile_k")
         if self.N % (self.tile_n * self.num_aie_columns) != 0:
             raise ValueError("N must be divisible by tile_n * num_aie_columns")
-        if self.kernel_vector_size != 32:
-            raise ValueError("W4A16GEMM currently supports kernel_vector_size=32 only")
-        if self.tile_k % self.kernel_vector_size != 0:
-            raise ValueError("tile_k must be a multiple of kernel_vector_size")
+        if self.tile_m != 4 and self.tile_m % 8 != 0:
+            raise ValueError(
+                "tile_m must be 4 or a multiple of 8 for aie::mmul<4,8,8>"
+            )
+        if self.tile_k % 8 != 0:
+            raise ValueError("tile_k must be a multiple of 8 for aie::mmul<4,8,8>")
+        if self.tile_n % 16 != 0:
+            raise ValueError(
+                "tile_n must be a multiple of 16 for 2x2 aie::mmul expansion"
+            )
         MLIROperator.__init__(self, context=self.context)
-
-    @property
-    def qparam_row_bytes(self) -> int:
-        return self.tile_k
 
     @property
     def k_tiles(self) -> int:
@@ -85,9 +85,10 @@ class W4A16GEMM(MLIROperator):
 
     def _kernel_object_name(self) -> str:
         return (
-            f"w4a16_gemm_bf16tile_{self.M}m_{self.K}k_{self.N}n_"
+            "w4a16_gemm_bf16tile_mmul_"
+            f"{self.M}m_{self.K}k_{self.N}n_"
             f"{self.tile_k}tk_{self.tile_n}tn_{self.group_size}g_"
-            f"{self.kernel_vector_size}vs.o"
+            f"{self.tile_m}tm.o"
         )
 
     def get_mlir_artifact(self):
@@ -129,7 +130,6 @@ class W4A16GEMM(MLIROperator):
                     f"-DTILE_K={self.tile_k}",
                     f"-DTILE_N={self.tile_n}",
                     f"-DGROUP_SIZE={self.group_size}",
-                    f"-DVEC_SIZE={self.kernel_vector_size}",
                 ],
             ),
         ]
@@ -143,8 +143,10 @@ class W4A16GEMM(MLIROperator):
                     self.num_aie_columns,
                     self.n_tile_groups,
                     self.k_tiles,
-                    self.tile_n,
-                    self.tile_k,
+                    self.tile_k // 8,
+                    self.tile_n // 8,
+                    8,
+                    8,
                 ),
                 dtype=bfloat16,
             ),
