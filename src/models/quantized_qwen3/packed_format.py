@@ -10,10 +10,14 @@ layout is not what we want to feed during inference. This module converts that
 layout once into an aligned binary blob:
 
 * dense tensors are stored as contiguous bf16 segments;
-* quantized Linear weights are stored in the exact row-major qparam layout used
-  by AIE: biased signed int4 values packed along K, followed by that row's bf16
-  group scales.  The nibble value is ``signed + 8`` so AIE kernels can
-  dequantize with an unpack and a subtract.
+* quantized Linear weights are stored in the row-major qparam layout used by
+  GEMV and in the column-stream compressed W4 tile layout used by GEMM.  The
+  GEMM layout is already ordered for ``aie::mmul<4,8,8>`` and carries an
+  expanded scale vector next to each packed int4 sub-tile, so the kernel can
+  dequantize tile-locally without a bf16 weight staging buffer.
+* paired K/V and gate/up GEMM weights are stored with a pair dimension inside
+  each K tile, letting the AIE kernel reuse one activation stream while staying
+  within the two-input-FIFO tile limit.
 
 The fast AIE path can consume the same blob layout; the PyTorch runtime uses it
 as a fused dequant/GEMM reference path.
@@ -31,7 +35,7 @@ import safetensors.torch
 import torch
 
 
-PACKED_FORMAT = "quantized_qwen3_w4a16_inference_v10"
+PACKED_FORMAT = "quantized_qwen3_w4a16_inference_v13"
 PACKED_DIRNAME = "qwen3_w4a16_packed"
 PACKED_MANIFEST = "manifest.json"
 PACKED_DATA = "weights.w4a16.bin"
@@ -201,7 +205,7 @@ def make_qparam(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     ).contiguous()
 
 
-def make_gemm_tile_qparam(
+def make_gemm_w4_mmul_tile(
     packed: torch.Tensor,
     scales: torch.Tensor,
     *,
@@ -211,47 +215,85 @@ def make_gemm_tile_qparam(
     tile_k: int = 128,
     tile_n: int = 64,
     num_aie_columns: int = 8,
+    n_tile_group_multiple: int = 1,
 ) -> torch.Tensor:
-    """Pack W4A16 weights in the B-tile order needed by fused GEMM.
+    """Pack compressed W4 B tiles in the order consumed by ``aie::mmul``.
 
-    The existing row-major qparam layout is good for GEMV because each core owns
-    contiguous output rows. GEMM streams B by K/N tiles, so the fast path needs a
-    second offline layout where each ``(tile_k, tile_n)`` weight tile is
-    contiguous and carries only the scales for that K tile.
+    Each ``(tile_k, tile_n)`` tile is split into ``8x8`` B vectors.  A vector
+    stores 64 biased int4 weights in 32 bytes.  The bf16 scales are stored as a
+    64-lane vector in the same ``s x t`` order consumed by ``aie::mmul``.  This
+    costs more bytes than storing 8 raw scales, but removes scalar scale-vector
+    construction from the hot loop.
     """
 
     if tile_k != group_size:
         raise ValueError(
-            "tile-major W4A16 GEMM currently requires tile_k == group_size "
+            "W4 tile GEMM currently requires tile_k == group_size "
             f"(tile_k={tile_k}, group_size={group_size})"
         )
     if in_features % tile_k != 0:
         raise ValueError(
             f"in_features ({in_features}) must be divisible by tile_k ({tile_k})"
         )
-    if out_features % tile_n != 0:
-        raise ValueError(
-            f"out_features ({out_features}) must be divisible by tile_n ({tile_n})"
-        )
+    mmul_s = 8
+    mmul_t = 8
+    if tile_k % mmul_s != 0:
+        raise ValueError(f"tile_k ({tile_k}) must be divisible by {mmul_s}")
+    if tile_n % mmul_t != 0:
+        raise ValueError(f"tile_n ({tile_n}) must be divisible by {mmul_t}")
+    if n_tile_group_multiple < 1:
+        raise ValueError("n_tile_group_multiple must be positive")
 
     packed = packed.detach().cpu().to(torch.uint8).contiguous()
     low = torch.bitwise_and(packed, 0x0F)
     high = torch.bitwise_and(torch.bitwise_right_shift(packed, 4), 0x0F)
     biased = torch.stack((low, high), dim=-1).flatten(1)[:, :in_features].contiguous()
-    scales_bytes = scales.detach().cpu().to(torch.bfloat16).contiguous().view(torch.uint8)
+    scales_bf16 = scales.detach().cpu().to(torch.bfloat16).contiguous()
+
+    tile_group_features = tile_n * num_aie_columns * n_tile_group_multiple
+    padded_out_features = (
+        (out_features + tile_group_features - 1)
+        // tile_group_features
+        * tile_group_features
+    )
+    if padded_out_features != out_features:
+        pad_rows = padded_out_features - out_features
+        biased = torch.cat(
+            (
+                biased,
+                torch.full((pad_rows, in_features), 8, dtype=torch.uint8),
+            ),
+            dim=0,
+        )
+        scales_bf16 = torch.cat(
+            (
+                scales_bf16,
+                torch.zeros((pad_rows, scales_bf16.shape[1]), dtype=torch.bfloat16),
+            ),
+            dim=0,
+        )
+
     k_tiles = in_features // tile_k
-    n_tiles = out_features // tile_n
+    n_tiles = padded_out_features // tile_n
     if n_tiles % num_aie_columns != 0:
         raise ValueError(
-            f"out_features ({out_features}) must provide a whole number of "
+            f"padded out_features ({padded_out_features}) must provide a whole number of "
             f"tile_n ({tile_n}) tiles per AIE column ({num_aie_columns})"
         )
     n_tile_groups = n_tiles // num_aie_columns
-    qvalue_tile_bytes = tile_k
-    scale_tile_bytes = 2
-    row_bytes = ((qvalue_tile_bytes + scale_tile_bytes + 31) // 32) * 32
-    tiled = torch.zeros(
-        (num_aie_columns, n_tile_groups, k_tiles, tile_n, row_bytes),
+    k_blocks = tile_k // mmul_s
+    n_blocks = tile_n // mmul_t
+    q_vector_bytes = mmul_s * mmul_t // 2
+    scale_block_bytes = mmul_s * mmul_t * 2
+    n_block_bytes = k_blocks * q_vector_bytes + scale_block_bytes
+    tiled = torch.empty(
+        (
+            num_aie_columns,
+            n_tile_groups,
+            k_tiles,
+            n_blocks,
+            n_block_bytes,
+        ),
         dtype=torch.uint8,
     )
 
@@ -263,115 +305,68 @@ def make_gemm_tile_qparam(
             for k_tile in range(k_tiles):
                 k_start = k_tile * tile_k
                 k_end = k_start + tile_k
-                scale_byte_start = k_tile * scale_tile_bytes
-                scale_byte_end = scale_byte_start + scale_tile_bytes
-                tiled[col, n_group, k_tile, :, :qvalue_tile_bytes] = biased[
-                    row_start:row_end,
-                    k_start:k_end,
-                ]
-                tiled[
-                    col,
-                    n_group,
-                    k_tile,
-                    :,
-                    qvalue_tile_bytes : qvalue_tile_bytes + scale_tile_bytes,
-                ] = scales_bytes[row_start:row_end, scale_byte_start:scale_byte_end]
-
-    return tiled.contiguous()
-
-
-def make_gemm_bf16_tile(
-    packed: torch.Tensor,
-    scales: torch.Tensor,
-    *,
-    in_features: int,
-    out_features: int,
-    group_size: int,
-    tile_k: int = 128,
-    tile_n: int = 64,
-    num_aie_columns: int = 8,
-) -> torch.Tensor:
-    """Pack pre-dequantized bf16 B tiles for the fused GEMM.
-
-    The AIE kernel consumes each ``(tile_k, tile_n)`` B tile as
-    ``(tile_k // 8, tile_n // 8, 8, 8)``. That is the natural ``s x t``
-    subtile order for ``aie::mmul<4,8,8>`` and avoids transposing the weight
-    tile at runtime.
-    """
-
-    if tile_k != group_size:
-        raise ValueError(
-            "bf16 tile GEMM currently requires tile_k == group_size "
-            f"(tile_k={tile_k}, group_size={group_size})"
-        )
-    if in_features % tile_k != 0:
-        raise ValueError(
-            f"in_features ({in_features}) must be divisible by tile_k ({tile_k})"
-        )
-    if out_features % tile_n != 0:
-        raise ValueError(
-            f"out_features ({out_features}) must be divisible by tile_n ({tile_n})"
-        )
-    mmul_s = 8
-    mmul_t = 8
-    if tile_k % mmul_s != 0:
-        raise ValueError(f"tile_k ({tile_k}) must be divisible by {mmul_s}")
-    if tile_n % mmul_t != 0:
-        raise ValueError(f"tile_n ({tile_n}) must be divisible by {mmul_t}")
-
-    packed = packed.detach().cpu().to(torch.uint8).contiguous()
-    low = torch.bitwise_and(packed, 0x0F)
-    high = torch.bitwise_and(torch.bitwise_right_shift(packed, 4), 0x0F)
-    biased = torch.stack((low, high), dim=-1).flatten(1)[:, :in_features]
-    signed = biased.to(torch.float32) - 8.0
-    scales_f32 = scales.detach().cpu().to(torch.float32).contiguous()
-
-    k_tiles = in_features // tile_k
-    n_tiles = out_features // tile_n
-    if n_tiles % num_aie_columns != 0:
-        raise ValueError(
-            f"out_features ({out_features}) must provide a whole number of "
-            f"tile_n ({tile_n}) tiles per AIE column ({num_aie_columns})"
-        )
-    n_tile_groups = n_tiles // num_aie_columns
-    tiled = torch.empty(
-        (
-            num_aie_columns,
-            n_tile_groups,
-            k_tiles,
-            tile_k // mmul_s,
-            tile_n // mmul_t,
-            mmul_s,
-            mmul_t,
-        ),
-        dtype=torch.bfloat16,
-    )
-
-    for col in range(num_aie_columns):
-        for n_group in range(n_tile_groups):
-            n_tile = n_group * num_aie_columns + col
-            row_start = n_tile * tile_n
-            row_end = row_start + tile_n
-            for k_tile in range(k_tiles):
-                k_start = k_tile * tile_k
-                k_end = k_start + tile_k
-                tile = (
-                    signed[row_start:row_end, k_start:k_end]
-                    * scales_f32[row_start:row_end, k_tile].view(tile_n, 1)
-                )
-                row_major_b = tile.t().contiguous().to(torch.bfloat16)
-                tiled[col, n_group, k_tile] = (
-                    row_major_b.view(
-                        tile_k // mmul_s,
-                        mmul_s,
-                        tile_n // mmul_t,
-                        mmul_t,
-                    )
+                row_major_b = biased[row_start:row_end, k_start:k_end].t().contiguous()
+                q_vectors = (
+                    row_major_b.view(k_blocks, mmul_s, n_blocks, mmul_t)
                     .permute(0, 2, 1, 3)
                     .contiguous()
+                    .view(k_blocks, n_blocks, mmul_s * mmul_t)
                 )
+                low_nibbles = q_vectors[:, :, 0::2]
+                high_nibbles = torch.bitwise_left_shift(q_vectors[:, :, 1::2], 4)
+                q_bytes = torch.bitwise_or(low_nibbles, high_nibbles).contiguous()
+                scale_values = scales_bf16[row_start:row_end, k_tile]
+                for n_block in range(n_blocks):
+                    scale_vector_bytes = (
+                        scale_values[
+                            n_block * mmul_t : (n_block + 1) * mmul_t
+                        ]
+                        .view(1, mmul_t)
+                        .expand(mmul_s, mmul_t)
+                        .contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1)
+                    )
+                    tiled[
+                        col,
+                        n_group,
+                        k_tile,
+                        n_block,
+                        : k_blocks * q_vector_bytes,
+                    ] = q_bytes[:, n_block, :].flatten()
+                    tiled[
+                        col,
+                        n_group,
+                        k_tile,
+                        n_block,
+                        k_blocks * q_vector_bytes :,
+                    ] = scale_vector_bytes
 
     return tiled.contiguous()
+
+
+def make_paired_gemm_w4_mmul_tile(
+    first: torch.Tensor,
+    second: torch.Tensor,
+) -> torch.Tensor:
+    if tuple(first.shape) != tuple(second.shape):
+        raise ValueError(
+            f"paired GEMM weights must have identical shapes, got "
+            f"{tuple(first.shape)} and {tuple(second.shape)}"
+        )
+    return torch.stack((first, second), dim=3).contiguous()
+
+
+def _paired_linear(prefix: str) -> tuple[str, int] | None:
+    if prefix.endswith(".self_attn.k_proj"):
+        return prefix[: -len(".k_proj")] + ".kv_proj", 0
+    if prefix.endswith(".self_attn.v_proj"):
+        return prefix[: -len(".v_proj")] + ".kv_proj", 1
+    if prefix.endswith(".mlp.gate_proj"):
+        return prefix[: -len(".gate_proj")] + ".gate_up_proj", 0
+    if prefix.endswith(".mlp.up_proj"):
+        return prefix[: -len(".up_proj")] + ".gate_up_proj", 1
+    return None
 
 
 def pack_biased_int4_bytes(signed: torch.Tensor) -> torch.Tensor:
@@ -451,6 +446,7 @@ def write_packed_inference_artifact(
         "quantization_config": quant_config,
         "dense": {},
         "linears": {},
+        "paired_linears": {},
     }
 
     with open(tmp_data, "wb") as f:
@@ -469,6 +465,7 @@ def write_packed_inference_artifact(
                 layout="contiguous",
             )
 
+        pending_pairs: dict[str, dict[int, tuple[str, torch.Tensor, dict[str, Any]]]] = {}
         for prefix in linears:
             qweight = tensors[f"{prefix}.qweight"]
             qzeros = tensors[f"{prefix}.qzeros"]
@@ -507,8 +504,8 @@ def write_packed_inference_artifact(
                 ),
                 "zero_bias": 8,
             }
-            gemm_tile_n = 16 if prefix == "lm_head" else 64
-            gemm_weight = make_gemm_bf16_tile(
+            gemm_tile_n = 64
+            gemm_w4_weight = make_gemm_w4_mmul_tile(
                 packed,
                 scales_out_major,
                 in_features=in_features,
@@ -516,26 +513,73 @@ def write_packed_inference_artifact(
                 group_size=group_size,
                 tile_n=gemm_tile_n,
             )
-            gemm_weight_offset, gemm_weight_length = _write_bytes(
+            gemm_w4_offset, gemm_w4_length = _write_bytes(
                 f,
-                _bf16_bytes(gemm_weight),
+                _uint8_bytes(gemm_w4_weight),
             )
-            linear_entry["gemm_weight"] = _segment(
-                name=f"{prefix}.gemm_tile_bf16_weight",
-                role="linear_gemm_tile_bf16_weight",
+            linear_entry["gemm_w4_weight"] = _segment(
+                name=f"{prefix}.gemm_tile_w4_weight",
+                role="linear_gemm_tile_w4_weight",
                 source=f"{prefix}.qweight",
-                shape=tuple(int(dim) for dim in gemm_weight.shape),
-                dtype="bfloat16",
-                byte_offset=gemm_weight_offset,
-                byte_length=gemm_weight_length,
-                layout="col_major_n_group_k_tile_kblock_nblock_s_t_bf16_mmul",
+                shape=tuple(int(dim) for dim in gemm_w4_weight.shape),
+                dtype="uint8",
+                byte_offset=gemm_w4_offset,
+                byte_length=gemm_w4_length,
+                layout="col_major_n_group_k_tile_nblock_kblock_q4bytes_then_scale64_bf16_mmul",
+            )
+            linear_entry["gemm_out_features"] = int(
+                gemm_w4_weight.shape[0] * gemm_w4_weight.shape[1] * gemm_tile_n
             )
             linear_entry["gemm_tile"] = {
                 "tile_k": 128,
                 "tile_n": gemm_tile_n,
                 "num_aie_columns": 8,
+                "n_tile_group_multiple": 1,
             }
             manifest["linears"][prefix] = linear_entry
+            paired = _paired_linear(prefix)
+            if paired is not None:
+                pair_name, pair_idx = paired
+                pending_pairs.setdefault(pair_name, {})[pair_idx] = (
+                    prefix,
+                    gemm_w4_weight,
+                    linear_entry,
+                )
+                if len(pending_pairs[pair_name]) == 2:
+                    first_prefix, first_weight, first_entry = pending_pairs[pair_name][0]
+                    second_prefix, second_weight, second_entry = pending_pairs[pair_name][1]
+                    paired_weight = make_paired_gemm_w4_mmul_tile(
+                        first_weight,
+                        second_weight,
+                    )
+                    pair_offset, pair_length = _write_bytes(
+                        f,
+                        _uint8_bytes(paired_weight),
+                    )
+                    manifest["paired_linears"][pair_name] = {
+                        "name": pair_name,
+                        "sources": [
+                            f"{first_prefix}.qweight",
+                            f"{second_prefix}.qweight",
+                        ],
+                        "in_features": int(first_entry["in_features"]),
+                        "out_features": int(first_entry["out_features"]),
+                        "gemm_out_features": int(first_entry["gemm_out_features"]),
+                        "group_size": int(first_entry["group_size"]),
+                        "num_groups": int(first_entry["num_groups"]),
+                        "gemm_w4_weight": _segment(
+                            name=f"{pair_name}.paired_gemm_tile_w4_weight",
+                            role="linear_paired_gemm_tile_w4_weight",
+                            source=f"{first_prefix}.qweight,{second_prefix}.qweight",
+                            shape=tuple(int(dim) for dim in paired_weight.shape),
+                            dtype="uint8",
+                            byte_offset=pair_offset,
+                            byte_length=pair_length,
+                            layout="col_major_n_group_k_tile_pair_nblock_kblock_q4bytes_then_scale64_bf16_mmul",
+                        ),
+                        "gemm_tile": dict(first_entry["gemm_tile"]),
+                        "zero_bias": 8,
+                    }
         if "lm_head" not in manifest["linears"]:
             lm_source = "lm_head.weight" if "lm_head.weight" in tensors else "model.embed_tokens.weight"
             if lm_source in tensors:
@@ -547,22 +591,29 @@ def write_packed_inference_artifact(
                 in_features = int(tensors[lm_source].shape[1])
                 qparam = make_qparam(packed, scales_out_major)
                 qparam_offset, qparam_length = _write_bytes(f, _uint8_bytes(qparam))
-                gemm_weight = make_gemm_bf16_tile(
+                lm_head_gemm_tile_n = 64
+                gemm_w4_weight = make_gemm_w4_mmul_tile(
                     packed,
                     scales_out_major,
                     in_features=in_features,
                     out_features=int(out_features),
                     group_size=group_size,
-                    tile_n=16,
+                    tile_n=lm_head_gemm_tile_n,
+                    n_tile_group_multiple=4,
                 )
-                gemm_weight_offset, gemm_weight_length = _write_bytes(
+                gemm_w4_offset, gemm_w4_length = _write_bytes(
                     f,
-                    _bf16_bytes(gemm_weight),
+                    _uint8_bytes(gemm_w4_weight),
                 )
                 lm_head_entry = {
                     "name": "lm_head",
                     "in_features": in_features,
                     "out_features": int(out_features),
+                    "gemm_out_features": int(
+                        gemm_w4_weight.shape[0]
+                        * gemm_w4_weight.shape[1]
+                        * lm_head_gemm_tile_n
+                    ),
                     "group_size": group_size,
                     "num_groups": int(scales_out_major.shape[1]),
                     "qparam": _segment(
@@ -575,20 +626,21 @@ def write_packed_inference_artifact(
                         byte_length=qparam_length,
                         layout="out_major_qweight_then_bf16_scales",
                     ),
-                    "gemm_weight": _segment(
-                        name="lm_head.gemm_tile_bf16_weight",
-                        role="linear_gemm_tile_bf16_weight",
+                    "gemm_w4_weight": _segment(
+                        name="lm_head.gemm_tile_w4_weight",
+                        role="linear_gemm_tile_w4_weight",
                         source=lm_source,
-                        shape=tuple(int(dim) for dim in gemm_weight.shape),
-                        dtype="bfloat16",
-                        byte_offset=gemm_weight_offset,
-                        byte_length=gemm_weight_length,
-                        layout="col_major_n_group_k_tile_kblock_nblock_s_t_bf16_mmul",
+                        shape=tuple(int(dim) for dim in gemm_w4_weight.shape),
+                        dtype="uint8",
+                        byte_offset=gemm_w4_offset,
+                        byte_length=gemm_w4_length,
+                        layout="col_major_n_group_k_tile_nblock_kblock_q4bytes_then_scale64_bf16_mmul",
                     ),
                     "gemm_tile": {
                         "tile_k": 128,
-                        "tile_n": 16,
+                        "tile_n": lm_head_gemm_tile_n,
                         "num_aie_columns": 8,
+                        "n_tile_group_multiple": 4,
                     },
                     "zero_bias": 8,
                     "synthetic": True,
@@ -642,33 +694,38 @@ class PackedInferenceStore:
             raise KeyError(f"missing packed linear {prefix!r}") from exc
         return spec, torch.from_numpy(self._numpy_view(spec["qparam"], np.dtype(np.uint8)))
 
-    def linear_gemm_weight(self, prefix: str) -> tuple[dict[str, Any], torch.Tensor]:
+    def linear_gemm_w4_weight(self, prefix: str) -> tuple[dict[str, Any], torch.Tensor]:
         try:
             spec = self.manifest["linears"][prefix]
         except KeyError as exc:
             raise KeyError(f"missing packed linear {prefix!r}") from exc
-        if "gemm_weight" not in spec:
+        if "gemm_w4_weight" not in spec:
             raise KeyError(
-                f"packed linear {prefix!r} does not contain GEMM bf16 tile weight; "
+                f"packed linear {prefix!r} does not contain GEMM W4 mmul tile weight; "
                 "rerun `python -m models.quantized_qwen3.pack`"
             )
         return spec, torch.from_numpy(
-            self._numpy_view(spec["gemm_weight"], np.dtype(np.uint16))
-        ).view(torch.bfloat16)
-
-    def linear_gemm_qparam(self, prefix: str) -> tuple[dict[str, Any], torch.Tensor]:
-        try:
-            spec = self.manifest["linears"][prefix]
-        except KeyError as exc:
-            raise KeyError(f"missing packed linear {prefix!r}") from exc
-        if "gemm_qparam" not in spec:
-            raise KeyError(
-                f"packed linear {prefix!r} does not contain legacy GEMM tile qparam; "
-                "rerun `python -m models.quantized_qwen3.pack`"
-            )
-        return spec, torch.from_numpy(
-            self._numpy_view(spec["gemm_qparam"], np.dtype(np.uint8))
+            self._numpy_view(spec["gemm_w4_weight"], np.dtype(np.uint8))
         )
+
+    def linear_paired_gemm_w4_weight(self, prefix: str) -> tuple[dict[str, Any], torch.Tensor]:
+        try:
+            spec = self.manifest["paired_linears"][prefix]
+        except KeyError as exc:
+            raise KeyError(
+                f"missing paired packed linear {prefix!r}; "
+                "rerun `python -m models.quantized_qwen3.pack`"
+            ) from exc
+        return spec, torch.from_numpy(
+            self._numpy_view(spec["gemm_w4_weight"], np.dtype(np.uint8))
+        )
+
+    def gemm_out_features(self, prefix: str) -> int:
+        try:
+            spec = self.manifest["linears"][prefix]
+        except KeyError as exc:
+            raise KeyError(f"missing packed linear {prefix!r}") from exc
+        return int(spec["gemm_out_features"])
 
     def linear_segments(self, prefix: str) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
         spec, _qparam = self.linear_qparam(prefix)

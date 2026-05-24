@@ -146,6 +146,7 @@ class LlamaChunkedAttention(MLIROperator):
                 extra_flags=[
                     f"-DLLAMA_HEAD_DIM={self.head_dim}",
                     f"-DLLAMA_CHUNK_SIZE={self.chunk_size}",
+                    f"-DLLAMA_Q_HEADS_PER_GROUP={self.q_heads_per_group}",
                     f"-DLLAMA_ATTN_SCALE={scale:.17g}f",
                     f"-DLLAMA_VEC_SIZE={self.kernel_vector_size}",
                 ],

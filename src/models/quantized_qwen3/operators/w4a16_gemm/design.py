@@ -52,24 +52,28 @@ def my_w4a16_gemm(
     n_tiles = N // tile_n
     n_tile_groups = n_tiles // cols
     bf16_dtype = np.dtype[bfloat16]
+    q_vector_bytes = mmul_s * mmul_t // 2
+    scale_vector_bytes = mmul_s * mmul_t * np.dtype(bfloat16).itemsize
+    n_blocks = tile_n // mmul_t
+    n_block_bytes = (tile_k // mmul_s) * q_vector_bytes + scale_vector_bytes
 
     L1_A_ty = np.ndarray[(tile_m, tile_k), bf16_dtype]
     L1_QP_ty = np.ndarray[
-        (tile_k // mmul_s, tile_n // mmul_t, mmul_s, mmul_t),
-        bf16_dtype,
+        (n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
     ]
     L1_C_ty = np.ndarray[(tile_m, tile_n), bf16_dtype]
     L2_C_ty = np.ndarray[(rows * tile_m, tile_n), bf16_dtype]
 
     L3_A_ty = np.ndarray[(M, K), bf16_dtype]
     L3_QP_ty = np.ndarray[
-        (cols, n_tile_groups, k_tiles, tile_k // mmul_s, tile_n // mmul_t, mmul_s, mmul_t),
-        bf16_dtype,
+        (cols, n_tile_groups, k_tiles, n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
     ]
     L3_C_ty = np.ndarray[(M, N), bf16_dtype]
 
     accum_kernel = Kernel(
-        f"{func_prefix}w4a16_gemm_accum_bf16",
+        f"{func_prefix}w4a16_gemm_accum_w4",
         f"{func_prefix}{kernel_object}",
         [np.int32, L1_A_ty, L1_QP_ty, L1_C_ty],
     )
@@ -184,14 +188,14 @@ def my_w4a16_gemm(
                     rt.fill(A_L3L2[row].prod(), A, a_tap, task_group=tg)
                 for col in range(cols):
                     qp_tap = TensorAccessPattern(
-                        (cols * n_tile_groups * k_tiles * tile_n * tile_k,),
+                        (cols * n_tile_groups * k_tiles * n_blocks * n_block_bytes,),
                         (
                             (col * n_tile_groups + n_group)
                             * k_tiles
-                            * tile_n
-                            * tile_k
+                            * n_blocks
+                            * n_block_bytes
                         ),
-                        [1, 1, 1, k_tiles * tile_n * tile_k],
+                        [1, 1, 1, k_tiles * n_blocks * n_block_bytes],
                         [0, 0, 0, 1],
                     )
                     rt.fill(QP_L3L2[col].prod(), QP, qp_tap, task_group=tg)
@@ -206,6 +210,714 @@ def my_w4a16_gemm(
                     rt.drain(
                         C_L2L3[col].cons(),
                         C,
+                        c_tap,
+                        wait=True,
+                        task_group=tg,
+                    )
+                rt.finish_task_group(tg)
+
+    return Program(dev, rt).resolve_program(SequentialPlacer())
+
+
+def my_w4a16_k_group_gemm(
+    dev,
+    cols,
+    rows,
+    M,
+    K,
+    N,
+    tile_m,
+    tile_k,
+    tile_n,
+    group_size,
+    k_group,
+    kernel_object="w4a16_gemm.o",
+    func_prefix="",
+    verbose=False,
+    trace_size=0,
+    trace_ddr_id=4,
+):
+    if verbose:
+        print(
+            "W4A16 K-group GEMM: "
+            f"M={M}, K={K}, N={N}, tile_m={tile_m}, tile_k={tile_k}, "
+            f"tile_n={tile_n}, rows={rows}, cols={cols}, k_group={k_group}"
+        )
+
+    assert tile_k == group_size
+    assert M % (tile_m * rows) == 0
+    assert K % tile_k == 0
+    assert (K // tile_k) % k_group == 0
+    assert N % (tile_n * cols) == 0
+    assert tile_k % 2 == 0
+    mmul_r = 4
+    mmul_s = 8
+    mmul_t = 8
+    assert tile_m == mmul_r or tile_m % (2 * mmul_r) == 0
+    assert tile_k % mmul_s == 0
+    assert tile_n % (2 * mmul_t) == 0
+
+    k_tiles = K // tile_k
+    k_tile_groups = k_tiles // k_group
+    m_tile_groups = M // (tile_m * rows)
+    n_tiles = N // tile_n
+    n_tile_groups = n_tiles // cols
+    bf16_dtype = np.dtype[bfloat16]
+    q_vector_bytes = mmul_s * mmul_t // 2
+    scale_vector_bytes = mmul_s * mmul_t * np.dtype(bfloat16).itemsize
+    n_blocks = tile_n // mmul_t
+    n_block_bytes = (tile_k // mmul_s) * q_vector_bytes + scale_vector_bytes
+
+    L1_A_GROUP_ty = np.ndarray[(k_group, tile_m, tile_k), bf16_dtype]
+    L1_QP_GROUP_ty = np.ndarray[
+        (k_group, n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
+    ]
+    L1_C_ty = np.ndarray[(tile_m, tile_n), bf16_dtype]
+    L2_C_ty = np.ndarray[(rows * tile_m, tile_n), bf16_dtype]
+
+    L3_A_ty = np.ndarray[(M, K), bf16_dtype]
+    L3_QP_ty = np.ndarray[
+        (cols, n_tile_groups, k_tiles, n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
+    ]
+    L3_C_ty = np.ndarray[(M, N), bf16_dtype]
+
+    accum_kernel = Kernel(
+        f"{func_prefix}w4a16_gemm_accum_w4_kgroup",
+        f"{func_prefix}{kernel_object}",
+        [np.int32, L1_A_GROUP_ty, L1_QP_GROUP_ty, L1_C_ty],
+    )
+
+    A_L3L2 = [
+        ObjectFifo(L1_A_GROUP_ty, name=f"kgroup_A_L3L2_{row}", depth=2)
+        for row in range(rows)
+    ]
+    A_L2L1 = [
+        A_L3L2[row].cons().forward(
+            obj_type=L1_A_GROUP_ty,
+            name=f"kgroup_A_L2L1_{row}",
+            depth=2,
+            dims_to_stream=[
+                (k_group * (tile_m // mmul_r), mmul_r * tile_k),
+                (tile_k // mmul_s, mmul_s),
+                (mmul_r, tile_k),
+                (mmul_s, 1),
+            ],
+            placement=Tile(row * 2 if cols == 8 else row, 1),
+        )
+        for row in range(rows)
+    ]
+    QP_L3L2 = [
+        ObjectFifo(L1_QP_GROUP_ty, name=f"kgroup_QP_L3L2_{col}", depth=2)
+        for col in range(cols)
+    ]
+    QP_L2L1 = [
+        QP_L3L2[col].cons().forward(
+            obj_type=L1_QP_GROUP_ty,
+            name=f"kgroup_QP_L2L1_{col}",
+            depth=2,
+            placement=Tile(col, 1),
+        )
+        for col in range(cols)
+    ]
+    C_L2L3 = [
+        ObjectFifo(
+            L2_C_ty,
+            name=f"kgroup_C_L2L3_{col}",
+            depth=2,
+            dims_to_stream=[
+                (tile_m // mmul_r, mmul_r * tile_n),
+                (mmul_r, mmul_t),
+                (tile_n // mmul_t, mmul_r * mmul_t),
+                (mmul_t, 1),
+            ],
+        )
+        for col in range(cols)
+    ]
+    C_L1L2 = [
+        C_L2L3[col]
+        .prod()
+        .join(
+            offsets=[row * tile_m * tile_n for row in range(rows)],
+            obj_types=[L1_C_ty] * rows,
+            names=[f"kgroup_C_L1L2_{row}_{col}" for row in range(rows)],
+            depths=[2] * rows,
+            placement=Tile(col, 1),
+        )
+        for col in range(cols)
+    ]
+
+    def core_body(a_fifo, qp_fifo, c_fifo, accum_kernel):
+        for _m_group in range(m_tile_groups):
+            for _n_group in range_(n_tile_groups):
+                c = c_fifo.acquire(1)
+                for _k_tile_group in range(k_tile_groups):
+                    a = a_fifo.acquire(1)
+                    qp = qp_fifo.acquire(1)
+                    accum_kernel(1 if _k_tile_group == 0 else 0, a, qp, c)
+                    a_fifo.release(1)
+                    qp_fifo.release(1)
+                c_fifo.release(1)
+
+    workers = [
+        Worker(
+            core_body,
+            [
+                A_L2L1[row].cons(),
+                QP_L2L1[col].cons(),
+                C_L1L2[col][row].prod(),
+                accum_kernel,
+            ],
+            placement=Tile(col, row + 2),
+            trace=1 if trace_size > 0 and row == 0 and col == 0 else None,
+        )
+        for row in range(rows)
+        for col in range(cols)
+    ]
+
+    sequence_types = [L3_A_ty, L3_QP_ty, L3_C_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
+    rt = Runtime()
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, QP, C = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=trace_ddr_id)
+        rt.start(*workers)
+        for m_group in range(m_tile_groups):
+            for n_group in range(n_tile_groups):
+                tg = rt.task_group()
+                for row in range(rows):
+                    a_tap = TensorAccessPattern(
+                        (M, K),
+                        (m_group * rows + row) * tile_m * K,
+                        [k_tile_groups, k_group, tile_m, tile_k],
+                        [k_group * tile_k, tile_k, K, 1],
+                    )
+                    rt.fill(A_L3L2[row].prod(), A, a_tap, task_group=tg)
+                for col in range(cols):
+                    qp_tap = TensorAccessPattern(
+                        (cols * n_tile_groups * k_tiles * n_blocks * n_block_bytes,),
+                        (
+                            (col * n_tile_groups + n_group)
+                            * k_tiles
+                            * n_blocks
+                            * n_block_bytes
+                        ),
+                        [k_tile_groups, k_group, n_blocks, n_block_bytes],
+                        [
+                            k_group * n_blocks * n_block_bytes,
+                            n_blocks * n_block_bytes,
+                            n_block_bytes,
+                            1,
+                        ],
+                    )
+                    rt.fill(QP_L3L2[col].prod(), QP, qp_tap, task_group=tg)
+                for col in range(cols):
+                    n_tile = n_group * cols + col
+                    c_tap = TensorAccessPattern(
+                        (M, N),
+                        m_group * rows * tile_m * N + n_tile * tile_n,
+                        [1, rows * tile_m, tile_n],
+                        [0, N, 1],
+                    )
+                    rt.drain(
+                        C_L2L3[col].cons(),
+                        C,
+                        c_tap,
+                        wait=True,
+                        task_group=tg,
+                    )
+                rt.finish_task_group(tg)
+
+    return Program(dev, rt).resolve_program(SequentialPlacer())
+
+
+def my_w4a16_n_shard_gemm(
+    dev,
+    cols,
+    rows,
+    M,
+    K,
+    N,
+    tile_m,
+    tile_k,
+    tile_n,
+    group_size,
+    kernel_object="w4a16_gemm.o",
+    func_prefix="",
+    verbose=False,
+    trace_size=0,
+    trace_ddr_id=4,
+):
+    if verbose:
+        print(
+            "W4A16 N-shard GEMM: "
+            f"M={M}, K={K}, N={N}, tile_m={tile_m}, tile_k={tile_k}, "
+            f"tile_n={tile_n}, rows={rows}, cols={cols}"
+        )
+
+    assert tile_k == group_size
+    assert M % tile_m == 0
+    assert K % tile_k == 0
+    assert N % (tile_n * cols * rows) == 0
+    mmul_r = 4
+    mmul_s = 8
+    mmul_t = 8
+    assert tile_m == mmul_r or tile_m % (2 * mmul_r) == 0
+    assert tile_k % mmul_s == 0
+    assert tile_n % (2 * mmul_t) == 0
+
+    k_tiles = K // tile_k
+    m_tile_groups = M // tile_m
+    n_tiles = N // tile_n
+    n_tile_groups_per_col = n_tiles // cols
+    n_tile_groups = n_tile_groups_per_col // rows
+    bf16_dtype = np.dtype[bfloat16]
+    q_vector_bytes = mmul_s * mmul_t // 2
+    scale_vector_bytes = mmul_s * mmul_t * np.dtype(bfloat16).itemsize
+    n_blocks = tile_n // mmul_t
+    n_block_bytes = (tile_k // mmul_s) * q_vector_bytes + scale_vector_bytes
+
+    L1_A_ty = np.ndarray[(tile_m, tile_k), bf16_dtype]
+    L1_QP_ty = np.ndarray[
+        (n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
+    ]
+    L2_QP_ty = np.ndarray[
+        (rows, n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
+    ]
+    L1_C_ty = np.ndarray[(tile_m, tile_n), bf16_dtype]
+    L2_C_ty = np.ndarray[(rows * tile_m, tile_n), bf16_dtype]
+
+    L3_A_ty = np.ndarray[(M, K), bf16_dtype]
+    L3_QP_ty = np.ndarray[
+        (cols, n_tile_groups_per_col, k_tiles, n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
+    ]
+    L3_C_ty = np.ndarray[(M, N), bf16_dtype]
+
+    accum_kernel = Kernel(
+        f"{func_prefix}w4a16_gemm_accum_w4",
+        f"{func_prefix}{kernel_object}",
+        [np.int32, L1_A_ty, L1_QP_ty, L1_C_ty],
+    )
+
+    A_L3L2 = ObjectFifo(L1_A_ty, name="nshard_A_L3L2", depth=2)
+    A_L2L1 = A_L3L2.cons().forward(
+        obj_type=L1_A_ty,
+        name="nshard_A_L2L1",
+        depth=2,
+        dims_to_stream=[
+            (tile_m // mmul_r, mmul_r * tile_k),
+            (tile_k // mmul_s, mmul_s),
+            (mmul_r, tile_k),
+            (mmul_s, 1),
+        ],
+        placement=Tile(0, 1),
+    )
+    QP_L3L2 = [
+        ObjectFifo(L2_QP_ty, name=f"nshard_QP_L3L2_{col}", depth=2)
+        for col in range(cols)
+    ]
+    QP_L2L1 = [
+        QP_L3L2[col]
+        .cons()
+        .split(
+            offsets=[row * n_blocks * n_block_bytes for row in range(rows)],
+            obj_types=[L1_QP_ty] * rows,
+            names=[f"nshard_QP_L2L1_{row}_{col}" for row in range(rows)],
+            depths=[2] * rows,
+            placement=Tile(col, 1),
+        )
+        for col in range(cols)
+    ]
+    C_L2L3 = [
+        ObjectFifo(
+            L2_C_ty,
+            name=f"nshard_C_L2L3_{col}",
+            depth=2,
+            dims_to_stream=[
+                (tile_m // mmul_r, mmul_r * tile_n),
+                (mmul_r, mmul_t),
+                (tile_n // mmul_t, mmul_r * mmul_t),
+                (mmul_t, 1),
+            ],
+        )
+        for col in range(cols)
+    ]
+    C_L1L2 = [
+        C_L2L3[col]
+        .prod()
+        .join(
+            offsets=[row * tile_m * tile_n for row in range(rows)],
+            obj_types=[L1_C_ty] * rows,
+            names=[f"nshard_C_L1L2_{row}_{col}" for row in range(rows)],
+            depths=[2] * rows,
+            placement=Tile(col, 1),
+        )
+        for col in range(cols)
+    ]
+
+    def core_body(a_fifo, qp_fifo, c_fifo, accum_kernel):
+        for _m_group in range(m_tile_groups):
+            for _n_group in range_(n_tile_groups):
+                c = c_fifo.acquire(1)
+                for _k_tile in range(k_tiles):
+                    a = a_fifo.acquire(1)
+                    qp = qp_fifo.acquire(1)
+                    accum_kernel(1 if _k_tile == 0 else 0, a, qp, c)
+                    a_fifo.release(1)
+                    qp_fifo.release(1)
+                c_fifo.release(1)
+
+    workers = [
+        Worker(
+            core_body,
+            [
+                A_L2L1.cons(),
+                QP_L2L1[col][row].cons(),
+                C_L1L2[col][row].prod(),
+                accum_kernel,
+            ],
+            placement=Tile(col, row + 2),
+            trace=1 if trace_size > 0 and row == 0 and col == 0 else None,
+        )
+        for row in range(rows)
+        for col in range(cols)
+    ]
+
+    sequence_types = [L3_A_ty, L3_QP_ty, L3_C_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
+    rt = Runtime()
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, QP, C = runtime_args[:3]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=trace_ddr_id)
+        rt.start(*workers)
+        for m_group in range(m_tile_groups):
+            for n_group in range(n_tile_groups):
+                tg = rt.task_group()
+                a_tap = TensorAccessPattern(
+                    (M, K),
+                    m_group * tile_m * K,
+                    [k_tiles, tile_m, tile_k],
+                    [tile_k, K, 1],
+                )
+                rt.fill(A_L3L2.prod(), A, a_tap, task_group=tg)
+                for col in range(cols):
+                    qp_tap = TensorAccessPattern(
+                        (
+                            cols
+                            * n_tile_groups_per_col
+                            * k_tiles
+                            * n_blocks
+                            * n_block_bytes,
+                        ),
+                        (
+                            (col * n_tile_groups_per_col + n_group * rows)
+                            * k_tiles
+                            * n_blocks
+                            * n_block_bytes
+                        ),
+                        [k_tiles, rows, n_blocks, n_block_bytes],
+                        [
+                            n_blocks * n_block_bytes,
+                            k_tiles * n_blocks * n_block_bytes,
+                            n_block_bytes,
+                            1,
+                        ],
+                    )
+                    rt.fill(QP_L3L2[col].prod(), QP, qp_tap, task_group=tg)
+                for col in range(cols):
+                    n_tile = n_group * rows * cols + col
+                    c_tap = TensorAccessPattern(
+                        (M, N),
+                        m_group * tile_m * N + n_tile * tile_n,
+                        [1, rows, tile_m, tile_n],
+                        [0, cols * tile_n, N, 1],
+                    )
+                    rt.drain(
+                        C_L2L3[col].cons(),
+                        C,
+                        c_tap,
+                        wait=True,
+                        task_group=tg,
+                    )
+                rt.finish_task_group(tg)
+
+    return Program(dev, rt).resolve_program(SequentialPlacer())
+
+
+def my_w4a16_paired_k_group_gemm(
+    dev,
+    cols,
+    rows,
+    M,
+    K,
+    N,
+    tile_m,
+    tile_k,
+    tile_n,
+    group_size,
+    k_group,
+    kernel_object="w4a16_paired_gemm.o",
+    func_prefix="",
+    verbose=False,
+    trace_size=0,
+    trace_ddr_id=5,
+):
+    if verbose:
+        print(
+            "W4A16 paired K-group GEMM: "
+            f"M={M}, K={K}, N={N}, tile_m={tile_m}, tile_k={tile_k}, "
+            f"tile_n={tile_n}, rows={rows}, cols={cols}, k_group={k_group}"
+        )
+
+    assert tile_k == group_size
+    assert M % (tile_m * rows) == 0
+    assert K % tile_k == 0
+    assert (K // tile_k) % k_group == 0
+    assert N % (tile_n * cols) == 0
+    mmul_r = 4
+    mmul_s = 8
+    mmul_t = 8
+    assert tile_m == mmul_r or tile_m % (2 * mmul_r) == 0
+    assert tile_k % mmul_s == 0
+    assert tile_n % (2 * mmul_t) == 0
+
+    k_tiles = K // tile_k
+    k_tile_groups = k_tiles // k_group
+    m_tile_groups = M // (tile_m * rows)
+    n_tiles = N // tile_n
+    n_tile_groups = n_tiles // cols
+    bf16_dtype = np.dtype[bfloat16]
+    q_vector_bytes = mmul_s * mmul_t // 2
+    scale_vector_bytes = mmul_s * mmul_t * np.dtype(bfloat16).itemsize
+    n_blocks = tile_n // mmul_t
+    n_block_bytes = (tile_k // mmul_s) * q_vector_bytes + scale_vector_bytes
+
+    L1_A_GROUP_ty = np.ndarray[(k_group, tile_m, tile_k), bf16_dtype]
+    L1_QP_PAIR_GROUP_ty = np.ndarray[
+        (k_group, 2, n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
+    ]
+    L1_C_ty = np.ndarray[(tile_m, tile_n), bf16_dtype]
+    L2_C_ty = np.ndarray[(rows * tile_m, tile_n), bf16_dtype]
+
+    L3_A_ty = np.ndarray[(M, K), bf16_dtype]
+    L3_QP_PAIR_ty = np.ndarray[
+        (cols, n_tile_groups, k_tiles, 2, n_blocks, n_block_bytes),
+        np.dtype[np.uint8],
+    ]
+    L3_C_ty = np.ndarray[(M, N), bf16_dtype]
+
+    accum_kernel = Kernel(
+        f"{func_prefix}w4a16_paired_gemm_accum_w4_kgroup",
+        f"{func_prefix}{kernel_object}",
+        [np.int32, L1_A_GROUP_ty, L1_QP_PAIR_GROUP_ty, L1_C_ty, L1_C_ty],
+    )
+
+    A_L3L2 = [
+        ObjectFifo(L1_A_GROUP_ty, name=f"pair_kgroup_A_L3L2_{row}", depth=2)
+        for row in range(rows)
+    ]
+    A_L2L1 = [
+        A_L3L2[row].cons().forward(
+            obj_type=L1_A_GROUP_ty,
+            name=f"pair_kgroup_A_L2L1_{row}",
+            depth=2,
+            dims_to_stream=[
+                (k_group * (tile_m // mmul_r), mmul_r * tile_k),
+                (tile_k // mmul_s, mmul_s),
+                (mmul_r, tile_k),
+                (mmul_s, 1),
+            ],
+            placement=Tile(row * 2 if cols == 8 else row, 1),
+        )
+        for row in range(rows)
+    ]
+    QP_L3L2 = [
+        ObjectFifo(
+            L1_QP_PAIR_GROUP_ty,
+            name=f"pair_kgroup_QP_L3L2_{col}",
+            depth=2,
+        )
+        for col in range(cols)
+    ]
+    QP_L2L1 = [
+        QP_L3L2[col].cons().forward(
+            obj_type=L1_QP_PAIR_GROUP_ty,
+            name=f"pair_kgroup_QP_L2L1_{col}",
+            depth=2,
+            placement=Tile(col, 1),
+        )
+        for col in range(cols)
+    ]
+
+    C0_L2L3 = [
+        ObjectFifo(
+            L2_C_ty,
+            name=f"pair_kgroup_C0_L2L3_{col}",
+            depth=2,
+            dims_to_stream=[
+                (tile_m // mmul_r, mmul_r * tile_n),
+                (mmul_r, mmul_t),
+                (tile_n // mmul_t, mmul_r * mmul_t),
+                (mmul_t, 1),
+            ],
+        )
+        for col in range(cols)
+    ]
+    C1_L2L3 = [
+        ObjectFifo(
+            L2_C_ty,
+            name=f"pair_kgroup_C1_L2L3_{col}",
+            depth=2,
+            dims_to_stream=[
+                (tile_m // mmul_r, mmul_r * tile_n),
+                (mmul_r, mmul_t),
+                (tile_n // mmul_t, mmul_r * mmul_t),
+                (mmul_t, 1),
+            ],
+        )
+        for col in range(cols)
+    ]
+    C0_L1L2 = [
+        C0_L2L3[col]
+        .prod()
+        .join(
+            offsets=[row * tile_m * tile_n for row in range(rows)],
+            obj_types=[L1_C_ty] * rows,
+            names=[f"pair_kgroup_C0_L1L2_{row}_{col}" for row in range(rows)],
+            depths=[2] * rows,
+            placement=Tile(col, 1),
+        )
+        for col in range(cols)
+    ]
+    C1_L1L2 = [
+        C1_L2L3[col]
+        .prod()
+        .join(
+            offsets=[row * tile_m * tile_n for row in range(rows)],
+            obj_types=[L1_C_ty] * rows,
+            names=[f"pair_kgroup_C1_L1L2_{row}_{col}" for row in range(rows)],
+            depths=[2] * rows,
+            placement=Tile(col, 1),
+        )
+        for col in range(cols)
+    ]
+
+    def core_body(a_fifo, qp_fifo, c0_fifo, c1_fifo, accum_kernel):
+        for _m_group in range(m_tile_groups):
+            for _n_group in range_(n_tile_groups):
+                c0 = c0_fifo.acquire(1)
+                c1 = c1_fifo.acquire(1)
+                for _k_tile_group in range(k_tile_groups):
+                    a = a_fifo.acquire(1)
+                    qp_pair = qp_fifo.acquire(1)
+                    accum_kernel(
+                        1 if _k_tile_group == 0 else 0,
+                        a,
+                        qp_pair,
+                        c0,
+                        c1,
+                    )
+                    a_fifo.release(1)
+                    qp_fifo.release(1)
+                c0_fifo.release(1)
+                c1_fifo.release(1)
+
+    workers = [
+        Worker(
+            core_body,
+            [
+                A_L2L1[row].cons(),
+                QP_L2L1[col].cons(),
+                C0_L1L2[col][row].prod(),
+                C1_L1L2[col][row].prod(),
+                accum_kernel,
+            ],
+            placement=Tile(col, row + 2),
+            trace=1 if trace_size > 0 and row == 0 and col == 0 else None,
+        )
+        for row in range(rows)
+        for col in range(cols)
+    ]
+
+    sequence_types = [L3_A_ty, L3_QP_PAIR_ty, L3_C_ty, L3_C_ty]
+    if trace_size > 0:
+        trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
+        sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
+
+    rt = Runtime()
+    with rt.sequence(*sequence_types) as runtime_args:
+        A, QP, C0, C1 = runtime_args[:4]
+        if trace_size > 0:
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=trace_ddr_id)
+        rt.start(*workers)
+        for m_group in range(m_tile_groups):
+            for n_group in range(n_tile_groups):
+                tg = rt.task_group()
+                for row in range(rows):
+                    a_tap = TensorAccessPattern(
+                        (M, K),
+                        (m_group * rows + row) * tile_m * K,
+                        [k_tile_groups, k_group, tile_m, tile_k],
+                        [k_group * tile_k, tile_k, K, 1],
+                    )
+                    rt.fill(A_L3L2[row].prod(), A, a_tap, task_group=tg)
+                for col in range(cols):
+                    qp_tap = TensorAccessPattern(
+                        (
+                            cols
+                            * n_tile_groups
+                            * k_tiles
+                            * 2
+                            * n_blocks
+                            * n_block_bytes,
+                        ),
+                        (
+                            (col * n_tile_groups + n_group)
+                            * k_tiles
+                            * 2
+                            * n_blocks
+                            * n_block_bytes
+                        ),
+                        [k_tile_groups, k_group, 2 * n_blocks, n_block_bytes],
+                        [
+                            k_group * 2 * n_blocks * n_block_bytes,
+                            2 * n_blocks * n_block_bytes,
+                            n_block_bytes,
+                            1,
+                        ],
+                    )
+                    rt.fill(QP_L3L2[col].prod(), QP, qp_tap, task_group=tg)
+                for col in range(cols):
+                    n_tile = n_group * cols + col
+                    c_tap = TensorAccessPattern(
+                        (M, N),
+                        m_group * rows * tile_m * N + n_tile * tile_n,
+                        [1, rows * tile_m, tile_n],
+                        [0, N, 1],
+                    )
+                    rt.drain(
+                        C0_L2L3[col].cons(),
+                        C0,
+                        c_tap,
+                        wait=True,
+                        task_group=tg,
+                    )
+                    rt.drain(
+                        C1_L2L3[col].cons(),
+                        C1,
                         c_tap,
                         wait=True,
                         task_group=tg,

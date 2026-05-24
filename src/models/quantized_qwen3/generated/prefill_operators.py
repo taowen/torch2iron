@@ -43,6 +43,7 @@ from models.quantized_qwen3.operators.w4a16_gemm.op import W4A16GEMM
 BF16_BYTES = 2
 PREFILL_NUM_AIE_COLUMNS = 8
 PREFILL_GEMM_TILE_SIZE = 64
+PREFILL_LM_HEAD_TILE_N = 64
 PREFILL_CHUNK_GEMM_TILE_M = 8
 
 
@@ -57,6 +58,7 @@ def _prefill_gemm(
     *,
     k,
     n,
+    tile_n=PREFILL_GEMM_TILE_SIZE,
     b_col_maj=False,
     separate_c_tiles=False,
 ):
@@ -68,7 +70,7 @@ def _prefill_gemm(
         N=n,
         num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
         tile_k=128,
-        tile_n=PREFILL_GEMM_TILE_SIZE,
+        tile_n=tile_n,
         group_size=config.group_size,
         context=context,
     )
@@ -136,7 +138,7 @@ def _dense_weight_names(config) -> list[str]:
     return names
 
 
-def _linear_qparam_names(config) -> list[str]:
+def _linear_qparam_names(config, *, include_lm_head: bool) -> list[str]:
     names = []
     for layer_idx in range(config.n_layers):
         names.extend(
@@ -144,6 +146,8 @@ def _linear_qparam_names(config) -> list[str]:
             for name, _source_suffix, transpose in PREFILL_LAYER_WEIGHT_SPECS
             if transpose
         )
+    if include_lm_head:
+        names.append("W_out_head_qparam")
     return names
 
 
@@ -163,6 +167,7 @@ def build_prefill_fused_op(
     chunk_size,
     compute_rows,
     q_head_block_size,
+    include_lm_head=False,
     dry_run=False,
 ):
     if config.n_layers != EXPECTED_PREFILL_LAYERS:
@@ -382,6 +387,16 @@ def build_prefill_fused_op(
         context=context,
     )
     ffn_down_op = _prefill_gemm(config, compute_rows, context, k=hidden_dim, n=emb_dim)
+    lm_head_op = None
+    if include_lm_head:
+        lm_head_op = _prefill_gemm(
+            config,
+            compute_rows,
+            context,
+            k=emb_dim,
+            n=config.lm_head_gemm_out_features,
+            tile_n=PREFILL_LM_HEAD_TILE_N,
+        )
 
     runlist = []
     for layer_idx in range(config.n_layers):
@@ -486,12 +501,16 @@ def build_prefill_fused_op(
         runlist.append((residual_add_op, "x", "ffn_output", "x"))
 
     runlist.append((rms_norm_op, "x", "W_final_norm", "hidden_out"))
+    if include_lm_head:
+        runlist.append((lm_head_op, "hidden_out", "W_out_head_qparam", "logits"))
 
     output_args = [
         "hidden_out",
         *[_present_key_name(i) for i in range(config.n_layers)],
         *[_present_value_name(i) for i in range(config.n_layers)],
     ]
+    if include_lm_head:
+        output_args.append("logits")
 
     return FusedMLIROperator(
         "prefill_chunk_fused_op",
@@ -501,6 +520,7 @@ def build_prefill_fused_op(
         buffer_sizes={
             "qkv_current": _bytes(q_current_elements),
             "hidden_out": _bytes(x_elements),
+            **({"logits": _bytes(compute_rows * config.lm_head_gemm_out_features)} if include_lm_head else {}),
             **{
                 name: _bytes(packet_elements)
                 for name in DECODE_PACKET_CACHE_NAMES
@@ -508,7 +528,7 @@ def build_prefill_fused_op(
         },
         external_args={
             "weight": _dense_weight_names(config),
-            "qparam": _linear_qparam_names(config),
+            "qparam": _linear_qparam_names(config, include_lm_head=include_lm_head),
             "kv_cache": list(DECODE_PACKET_CACHE_NAMES),
         },
         compile_mode="full_elf_dynamic",

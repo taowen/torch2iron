@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from iron.common.context import AIEContext
-from torch2iron.fusion import FusedMLIROperator
+from torch2iron.fusion import load_elf
 
 from models.quantized_qwen3.batch_decode_fused import (
     batch_decode_dense_weight_names,
@@ -19,8 +19,6 @@ from models.quantized_qwen3.batch_decode_fused import (
 )
 from models.quantized_qwen3.generated.prefill_layout import PREFILL_LAYER_WEIGHT_SPECS
 from models.quantized_qwen3.generated.prefill_operators import build_prefill_fused_op
-from models.quantized_qwen3.operators.w4a16_gemm.op import W4A16GEMM
-from models.quantized_qwen3.operators.w4a16_gemv.op import W4A16GEMV
 from models.quantized_qwen3.qwen_weight_layout import iter_qwen_decode_weight_specs
 from models.quantized_qwen3.runtime_config import (
     DECODE_ATTN_CHUNK_SIZE,
@@ -56,7 +54,7 @@ class AIEQwenOperators:
             f"_rows{prefill_config.compute_rows}"
             f"_qhblk{prefill_config.q_head_block_size}"
         )
-        self.prefill.fused_op = build_prefill_fused_op(
+        self.prefill.body_fused_op = build_prefill_fused_op(
             config,
             prompt_len,
             prefill_build_suffix,
@@ -64,45 +62,27 @@ class AIEQwenOperators:
             compute_rows=prefill_config.compute_rows,
             q_head_block_size=prefill_config.q_head_block_size,
         )
-        self.prefill.fused = self.prefill.fused_op.get_callable()
+        final_prefill_build_suffix = f"{prefill_build_suffix}_final_lm_head"
+        self.prefill.final_fused_op = build_prefill_fused_op(
+            config,
+            prompt_len,
+            final_prefill_build_suffix,
+            chunk_size=prefill_config.chunk_size,
+            compute_rows=prefill_config.compute_rows,
+            q_head_block_size=prefill_config.q_head_block_size,
+            include_lm_head=True,
+        )
+        self.prefill.body_elf_data = load_elf(self.prefill.body_fused_op)
+        self.prefill.final_elf_data = load_elf(self.prefill.final_fused_op)
+        self.prefill.fused_op = self.prefill.final_fused_op
+        self.prefill.fused = self.prefill.final_fused_op.get_callable()
+        self.prefill.loaded_elf_kind = "final"
 
         load_prefill_fused_weight_buffers(config, self.prefill.fused)
         self.prefill.fused.weight_buffer.to("npu")
         self.prefill.fused.qparam_buffer.to("npu")
         self.prefill.fused.scratch_buffer.to("npu")
         self.prefill.fused.output_buffer.to("npu")
-        self._build_prefill_lm_head_op(config, prefill_build_suffix)
-
-    def _build_prefill_lm_head_op(self, config, build_suffix):
-        context = AIEContext(build_dir=Path("build_elf") / f"{build_suffix}_lm_head")
-        op = W4A16GEMV(
-            M=config.vocab_size,
-            K=config.emb_dim,
-            num_aie_columns=8,
-            tile_size_input=8,
-            tile_size_output=16,
-            context=context,
-        )
-        fused_op = FusedMLIROperator(
-            "prefill_lm_head_w4a16",
-            [(op, "W_out_head_qparam", "x", "logits")],
-            input_args=["x"],
-            output_args=["logits"],
-            external_args={"qparam": ["W_out_head_qparam"]},
-            compile_mode="full_elf_dynamic",
-            context=context,
-        ).compile()
-        fused = fused_op.get_callable()
-
-        _, qparam = config.weight_store.linear_qparam("lm_head")
-        fused.mark_buffer_dirty("qparam")
-        fused.get_buffer("W_out_head_qparam").torch_view()[:] = qparam.flatten()
-        fused.qparam_buffer.to("npu")
-        fused.input_buffer.to("npu")
-        fused.output_buffer.to("npu")
-
-        self.prefill.lm_head_fused_op = fused_op
-        self.prefill.lm_head_fused = fused
 
     def _build_decode_ops(self, config, max_seq_len, *, batch_size):
         decode_suffix = (
@@ -133,86 +113,6 @@ class AIEQwenOperators:
         self.decode.fused = fused
         self.decode.current_cache_slot = current_cache_slot
         self.decode.decode_rows = decode_rows
-        self._build_decode_lm_head_op(config, decode_suffix, batch_size)
-
-    def _build_decode_lm_head_op(self, config, build_suffix, batch_size):
-        if batch_size == 1:
-            context = AIEContext(
-                build_dir=Path("build_batch_elf")
-                / f"{build_suffix}_lm_head_gemv_batch1"
-            )
-            op = W4A16GEMV(
-                M=config.vocab_size,
-                K=config.emb_dim,
-                num_aie_columns=8,
-                tile_size_input=8,
-                tile_size_output=16,
-                num_batches=1,
-                shared_qparam=True,
-                context=context,
-            )
-            fused_op = FusedMLIROperator(
-                "batch_decode_lm_head_w4a16",
-                [(op, "W_out_head_qparam", "x", "logits")],
-                input_args=["x"],
-                output_args=["logits"],
-                external_args={"qparam": ["W_out_head_qparam"]},
-                compile_mode="full_elf_dynamic",
-                context=context,
-            ).compile()
-            fused = fused_op.get_callable()
-
-            _linear_spec, qparam = config.weight_store.linear_qparam("lm_head")
-            fused.mark_buffer_dirty("qparam")
-            fused.get_buffer("W_out_head_qparam").torch_view()[:] = qparam.flatten()
-            fused.qparam_buffer.to("npu")
-            fused.input_buffer.to("npu")
-            fused.output_buffer.to("npu")
-
-            self.decode.lm_head_fused_op = fused_op
-            self.decode.lm_head_fused = fused
-            self.decode.lm_head_rows = 1
-            return
-
-        decode_rows = select_batch_decode_rows(batch_size)
-        tile_m = 4 if decode_rows <= 8 else 8
-        context = AIEContext(
-            build_dir=Path("build_batch_elf")
-            / f"{build_suffix}_lm_head_gemm_rows{decode_rows}"
-        )
-        op = W4A16GEMM(
-            M=decode_rows,
-            K=config.emb_dim,
-            N=config.vocab_size,
-            num_aie_columns=8,
-            num_aie_rows=decode_rows // tile_m,
-            tile_m=tile_m,
-            tile_k=128,
-            tile_n=16,
-            group_size=config.group_size,
-            context=context,
-        )
-        fused_op = FusedMLIROperator(
-            "batch_decode_lm_head_w4a16_gemm",
-            [(op, "x", "W_out_head_gemm_weight", "logits")],
-            input_args=["x"],
-            output_args=["logits"],
-            external_args={"weight": ["W_out_head_gemm_weight"]},
-            compile_mode="full_elf_dynamic",
-            context=context,
-        ).compile()
-        fused = fused_op.get_callable()
-
-        _linear_spec, gemm_weight = config.weight_store.linear_gemm_weight("lm_head")
-        fused.mark_buffer_dirty("weight")
-        fused.get_buffer("W_out_head_gemm_weight").torch_view()[:] = gemm_weight.flatten()
-        fused.weight_buffer.to("npu")
-        fused.input_buffer.to("npu")
-        fused.output_buffer.to("npu")
-
-        self.decode.lm_head_fused_op = fused_op
-        self.decode.lm_head_fused = fused
-        self.decode.lm_head_rows = decode_rows
 
 
 def _is_linear_source(source: str) -> bool:
@@ -256,10 +156,25 @@ def load_batch_decode_weight_buffers(config, fused):
         qparam_name = f"{spec['name']}_qparam"
         if qparam_name not in qparam_names:
             continue
-        _linear_spec, gemm_weight = config.weight_store.linear_gemm_weight(
+        _linear_spec, w4_weight = config.weight_store.linear_gemm_w4_weight(
             _linear_prefix(spec["source"])
         )
-        fused.get_buffer(qparam_name).torch_view()[:] = gemm_weight.flatten()
+        fused.get_buffer(qparam_name).torch_view()[:] = w4_weight.flatten()
+
+    for layer_idx in range(config.n_layers):
+        prefix = f"model.layers.{layer_idx}"
+        _pair_spec, kv_weight = config.weight_store.linear_paired_gemm_w4_weight(
+            f"{prefix}.self_attn.kv_proj"
+        )
+        fused.get_buffer(f"W_attn_key_value_{layer_idx}_qparam").torch_view()[
+            :
+        ] = kv_weight.flatten()
+        _pair_spec, gate_up_weight = config.weight_store.linear_paired_gemm_w4_weight(
+            f"{prefix}.mlp.gate_up_proj"
+        )
+        fused.get_buffer(f"W_ffn_gate_up_{layer_idx}_qparam").torch_view()[
+            :
+        ] = gate_up_weight.flatten()
 
 
 def _copy_buffer(fused, name, tensor):
@@ -275,11 +190,13 @@ def load_prefill_fused_weight_buffers(config, fused):
             source = f"{prefix}.{source_suffix}"
             target_name = f"{name}_{layer_idx}"
             if _is_linear_source(source):
-                _linear_spec, gemm_weight = config.weight_store.linear_gemm_weight(
+                _linear_spec, w4_weight = config.weight_store.linear_gemm_w4_weight(
                     _linear_prefix(source)
                 )
-                fused.get_buffer(f"{target_name}_qparam").torch_view()[:] = gemm_weight.flatten()
+                fused.get_buffer(f"{target_name}_qparam").torch_view()[:] = w4_weight.flatten()
             else:
                 _copy_buffer(fused, target_name, config.weights[source])
 
     _copy_buffer(fused, "W_final_norm", config.weights["model.norm.weight"])
+    _linear_spec, lm_head_w4_weight = config.weight_store.linear_gemm_w4_weight("lm_head")
+    fused.get_buffer("W_out_head_qparam").torch_view()[:] = lm_head_w4_weight.flatten()

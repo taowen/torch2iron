@@ -10,7 +10,7 @@ export PROMPT_LEN
 export NUM_TOKENS
 export BATCH_SIZE
 
-exec "$(dirname "${BASH_SOURCE[0]}")/run_exported_qwen3_batch_inference.sh" \
+exec "$(dirname "${BASH_SOURCE[0]}")/run_quantized_qwen3_batch_inference.sh" \
   --prompt "Count from 1 to 10:" \
   --prompt "The capital of France is" \
   "$@"

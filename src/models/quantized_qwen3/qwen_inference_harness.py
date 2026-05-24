@@ -57,6 +57,7 @@ class QwenConfig:
 
         self.packed_weights_dir = packed_dir
         self.weight_store = PackedInferenceStore(packed_dir)
+        self.lm_head_gemm_out_features = self.weight_store.gemm_out_features("lm_head")
         self.weights = {
             name: self.weight_store.dense(name)
             for name in self.weight_store.manifest.get("dense", {})

@@ -32,6 +32,86 @@ static inline int32_t state_index(int32_t query, int32_t q_head, int32_t q_heads
     return (query * q_heads + q_head) * 2;
 }
 
+static inline void scale_acc_inplace(float *__restrict acc,
+                                     float scale,
+                                     int32_t head_dim)
+{
+    constexpr int vec_len = LLAMA_VEC_SIZE;
+    aie::vector<float, vec_len> scale_vec =
+        aie::broadcast<float, vec_len>(scale);
+
+    for (int32_t dim = 0; dim < head_dim; dim += vec_len) {
+        aie::accum<accfloat, vec_len> acc_vec;
+        acc_vec.from_vector(aie::load_v<vec_len>(acc + dim), 0);
+        acc_vec = aie::mul(acc_vec.to_vector<float>(), scale_vec);
+        aie::store_v(acc + dim, acc_vec.to_vector<float>());
+    }
+}
+
+static inline void accumulate_value_inplace(float *__restrict acc,
+                                            const bfloat16 *__restrict value,
+                                            float weight,
+                                            int32_t head_dim)
+{
+    constexpr int vec_len = LLAMA_VEC_SIZE;
+    aie::vector<float, vec_len> weight_vec =
+        aie::broadcast<float, vec_len>(weight);
+
+    for (int32_t dim = 0; dim < head_dim; dim += vec_len) {
+        aie::accum<accfloat, vec_len> acc_vec;
+        acc_vec.from_vector(aie::load_v<vec_len>(acc + dim), 0);
+
+        aie::accum<accfloat, vec_len> value_vec;
+        value_vec.from_vector(aie::load_v<vec_len>(value + dim), 0);
+
+        aie::accum<accfloat, vec_len> weighted_value =
+            aie::mul(value_vec.to_vector<float>(), weight_vec);
+        acc_vec = aie::add(acc_vec, weighted_value.to_vector<float>());
+        aie::store_v(acc + dim, acc_vec.to_vector<float>());
+    }
+}
+
+static inline void zero_bf16_vector(bfloat16 *__restrict out,
+                                    int32_t head_dim)
+{
+    constexpr int vec_len = LLAMA_VEC_SIZE;
+    aie::vector<bfloat16, vec_len> zero_vec =
+        aie::zeros<bfloat16, vec_len>();
+
+    for (int32_t dim = 0; dim < head_dim; dim += vec_len) {
+        aie::store_v(out + dim, zero_vec);
+    }
+}
+
+static inline void zero_float_vector(float *__restrict out,
+                                     int32_t head_dim)
+{
+    constexpr int vec_len = LLAMA_VEC_SIZE;
+    aie::vector<float, vec_len> zero_vec =
+        aie::zeros<float, vec_len>();
+
+    for (int32_t dim = 0; dim < head_dim; dim += vec_len) {
+        aie::store_v(out + dim, zero_vec);
+    }
+}
+
+static inline void normalize_acc_to_bf16(const float *__restrict acc,
+                                         bfloat16 *__restrict out,
+                                         float inv,
+                                         int32_t head_dim)
+{
+    constexpr int vec_len = LLAMA_VEC_SIZE;
+    aie::vector<float, vec_len> inv_vec =
+        aie::broadcast<float, vec_len>(inv);
+
+    for (int32_t dim = 0; dim < head_dim; dim += vec_len) {
+        aie::accum<accfloat, vec_len> acc_vec;
+        acc_vec.from_vector(aie::load_v<vec_len>(acc + dim), 0);
+        acc_vec = aie::mul(acc_vec.to_vector<float>(), inv_vec);
+        aie::store_v(out + dim, acc_vec.to_vector<bfloat16>());
+    }
+}
+
 static inline void update_query_state(float *__restrict q_state,
                                       float *__restrict q_acc,
                                       const bfloat16 *__restrict q,
@@ -74,9 +154,7 @@ static inline void update_query_state(float *__restrict q_state,
     float correction = old_sum > 0.0f ? exp_approx(old_max - new_max) : 0.0f;
     float chunk_sum = 0.0f;
 
-    for (int32_t dim = 0; dim < head_dim; dim++) {
-        q_acc[dim] *= correction;
-    }
+    scale_acc_inplace(q_acc, correction, head_dim);
 
     for (int32_t row = 0; row < rows; row++) {
         float score = scores[row];
@@ -84,9 +162,7 @@ static inline void update_query_state(float *__restrict q_state,
         chunk_sum += weight;
 
         const bfloat16 *__restrict v_row = v + row * head_dim;
-        for (int32_t dim = 0; dim < head_dim; dim++) {
-            q_acc[dim] += weight * static_cast<float>(v_row[dim]);
-        }
+        accumulate_value_inplace(q_acc, v_row, weight, head_dim);
     }
 
     q_state[0] = new_max;
@@ -111,9 +187,7 @@ void llama_chunked_prefill_attention_init_f32(float *__restrict state,
 
             float *__restrict q_acc =
                 acc + q_index(query, q_head, 0, q_heads, head_dim);
-            for (int32_t dim = 0; dim < head_dim; dim++) {
-                q_acc[dim] = 0.0f;
-            }
+            zero_float_vector(q_acc, head_dim);
         }
     }
 
@@ -189,9 +263,7 @@ void llama_chunked_prefill_attention_update_past_bf16(
                 old_sum > 0.0f ? exp_approx(old_max - new_max) : 0.0f;
             float chunk_sum = 0.0f;
 
-            for (int32_t dim = 0; dim < head_dim; dim++) {
-                q_acc[dim] *= correction;
-            }
+            scale_acc_inplace(q_acc, correction, head_dim);
 
             for (int32_t row = 0; row < chunk_size; row++) {
                 if (static_cast<float>(mask[row]) <= 0.5f) {
@@ -203,9 +275,7 @@ void llama_chunked_prefill_attention_update_past_bf16(
                 chunk_sum += weight;
 
                 const bfloat16 *__restrict v_row = v + row * head_dim;
-                for (int32_t dim = 0; dim < head_dim; dim++) {
-                    q_acc[dim] += weight * static_cast<float>(v_row[dim]);
-                }
+                accumulate_value_inplace(q_acc, v_row, weight, head_dim);
             }
 
             q_state[0] = new_max;
@@ -276,14 +346,10 @@ void llama_chunked_prefill_attention_finalize_bf16(
                 out_full + q_index(query, q_head, 0, q_heads, head_dim);
             float denom = state[st + 1];
             if (denom <= 0.0f) {
-                for (int32_t dim = 0; dim < head_dim; dim++) {
-                    out[dim] = static_cast<bfloat16>(0.0f);
-                }
+                zero_bf16_vector(out, head_dim);
             } else {
                 float inv = 1.0f / denom;
-                for (int32_t dim = 0; dim < head_dim; dim++) {
-                    out[dim] = static_cast<bfloat16>(q_acc[dim] * inv);
-                }
+                normalize_acc_to_bf16(q_acc, out, inv, head_dim);
             }
         }
     }

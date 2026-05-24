@@ -76,20 +76,15 @@ def _append_prefill_chunk_to_packet_cache(
         )
 
 
-def _run_lm_head_for_last_chunk(runner, hidden_out, valid_len):
-    config = runner.config
-    fused = runner.aie_ops.prefill.lm_head_fused
-    fused.mark_buffer_dirty("input")
-    fused.get_buffer("x").torch_view()[:] = hidden_out[valid_len - 1, :]
-    fused()
-    return fused.get_buffer("logits").torch_view().view(1, 1, config.vocab_size)
-
-
-def _reset_prefill_dispatch_if_needed(prefill_ops):
+def _select_prefill_elf(prefill_ops, *, final_chunk: bool):
     fused = prefill_ops.fused
-    if not getattr(prefill_ops, "_prefill_dispatch_has_run", False):
+    elf_kind = "final" if final_chunk else "body"
+    has_run = getattr(prefill_ops, "_prefill_dispatch_has_run", False)
+    if prefill_ops.loaded_elf_kind == elf_kind and not has_run:
         return
-    fused.reload_elf(fused._elf_data)
+    elf_data = prefill_ops.final_elf_data if final_chunk else prefill_ops.body_elf_data
+    fused.reload_elf(elf_data)
+    prefill_ops.loaded_elf_kind = elf_kind
     fused.weight_buffer.to("npu")
     fused.qparam_buffer.to("npu")
     fused.kv_cache_buffer.to("npu")
@@ -120,6 +115,7 @@ def prefill_forward_pass(runner, state):
     for chunk_start in range(0, seq_len, chunk_size):
         valid_len = min(chunk_size, seq_len - chunk_start)
         chunk_end = chunk_start + valid_len
+        final_chunk = chunk_end == seq_len
 
         fused.mark_buffer_dirty("input")
         rope_angles = fused.get_buffer("rope_angles").torch_view().view(
@@ -136,7 +132,7 @@ def prefill_forward_pass(runner, state):
         x_input.zero_()
         x_input[:valid_len, :] = x[0, :, :]
 
-        _reset_prefill_dispatch_if_needed(prefill_ops)
+        _select_prefill_elf(prefill_ops, final_chunk=final_chunk)
         fused()
         prefill_ops._prefill_dispatch_has_run = True
 
@@ -151,11 +147,16 @@ def prefill_forward_pass(runner, state):
                 chunk_size,
             )
 
-        if chunk_end == seq_len:
-            hidden_out = fused.get_buffer("hidden_out").torch_view().view(
-                compute_rows, config.emb_dim
+        if final_chunk:
+            logits = fused.get_buffer("logits").torch_view().view(
+                compute_rows,
+                config.lm_head_gemm_out_features,
             )
-            last_logits = _run_lm_head_for_last_chunk(runner, hidden_out, valid_len)
+            last_logits = logits[valid_len - 1 : valid_len, : config.vocab_size].view(
+                1,
+                1,
+                config.vocab_size,
+            )
 
     if last_logits is None:
         raise RuntimeError("prefill produced no logits")

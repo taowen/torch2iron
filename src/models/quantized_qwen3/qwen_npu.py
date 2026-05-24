@@ -223,31 +223,17 @@ class QwenNpuRunner:
                 )
         cache_stop = time.perf_counter() if profile_decode else 0.0
 
-        hidden_out = fused.get_buffer("hidden_out").torch_view().view(
-            self.decode_rows,
-            config.emb_dim,
-        )
-        lm_head = self.aie_ops.decode.lm_head_fused
-        lm_head_rows = self.aie_ops.decode.lm_head_rows
-        lm_head.mark_buffer_dirty("input")
-        lm_head.get_buffer("x").torch_view().view(
-            lm_head_rows,
-            config.emb_dim,
-        )[:, :] = hidden_out[:lm_head_rows, :]
-        lm_head_start = time.perf_counter() if profile_decode else 0.0
-        lm_head()
-        lm_head_stop = time.perf_counter() if profile_decode else 0.0
         if profile_decode:
             logging.info(
-                "decode profile: transformer=%.4fs cache=%.4fs lm_head=%.4fs",
+                "decode profile: fused_transformer_lm_head=%.4fs cache=%.4fs",
                 transformer_stop - transformer_start,
                 cache_stop - cache_start,
-                lm_head_stop - lm_head_start,
             )
-        return lm_head.get_buffer("logits").torch_view().view(
-            lm_head_rows,
-            config.vocab_size,
-        )[: self.batch_size, :].view(self.batch_size, 1, config.vocab_size)
+        logits = fused.get_buffer("logits").torch_view().view(
+            self.decode_rows,
+            config.lm_head_gemm_out_features,
+        )[: self.batch_size, : config.vocab_size]
+        return logits.view(self.batch_size, 1, config.vocab_size)
 
 
 def _make_batch_prompts(

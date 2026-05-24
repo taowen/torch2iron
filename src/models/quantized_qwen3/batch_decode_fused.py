@@ -7,8 +7,8 @@
 
 Single-request decode is batch decode with one active row.  The transformer
 projections, FFN projections, and final norm live in the same ELF.  The AIE
-GEMM operators consume the offline bf16 tile view of W4A16 weights from the
-packed artifact.
+GEMM operators consume compressed W4 tiles from the packed artifact and perform
+tile-local dequantization inside the `aie::mmul` kernel.
 """
 
 from __future__ import annotations
@@ -20,19 +20,25 @@ from iron.common.context import AIEContext
 from torch2iron.fusion import FusedMLIROperator
 from torch2iron.operators import (
     CopyPresentPacketKV,
-    ElementwiseAdd,
     LlamaChunkedAttention,
     RMSNorm,
-    RoPE,
+    RMSNormRoPE,
+    ResidualAddRMSNorm,
     SiLUMul,
 )
 
 from models.quantized_qwen3.generated.decode_layout import (
+    DECODE_LM_HEAD_WEIGHT_NAMES,
     DECODE_TRANSFORMER_WEIGHT_NAMES,
     DECODE_WEIGHT_SPECS,
     EXPECTED_DECODE_LAYERS,
 )
-from models.quantized_qwen3.operators.w4a16_gemm.op import W4A16GEMM
+from models.quantized_qwen3.operators.w4a16_gemm.op import (
+    W4A16GEMM,
+    W4A16KGroupGEMM,
+    W4A16NShardGEMM,
+    W4A16PairedKGroupGEMM,
+)
 from models.quantized_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
@@ -43,6 +49,7 @@ BATCH_DECODE_COLUMNS = 8
 BATCH_DECODE_GEMM_TILE_M = 8
 BATCH_DECODE_GEMM_TILE_K = 128
 BATCH_DECODE_TRANSFORMER_TILE_N = 64
+BATCH_DECODE_LM_HEAD_TILE_N = 64
 
 
 def _bytes(elements: int) -> int:
@@ -126,11 +133,23 @@ def batch_decode_dense_weight_names() -> list[str]:
 
 def batch_decode_qparam_names() -> list[str]:
     specs = _spec_by_name()
-    return [
+    names = [
         f"{name}_qparam"
-        for name in DECODE_TRANSFORMER_WEIGHT_NAMES
+        for name in (*DECODE_TRANSFORMER_WEIGHT_NAMES, *DECODE_LM_HEAD_WEIGHT_NAMES)
         if _is_linear_source(str(specs[name]["source"]))
+        and not str(specs[name]["source"]).endswith(
+            (
+                "k_proj.weight",
+                "v_proj.weight",
+                "gate_proj.weight",
+                "up_proj.weight",
+            )
+        )
     ]
+    for layer_idx in range(EXPECTED_DECODE_LAYERS):
+        names.append(f"W_attn_key_value_{layer_idx}_qparam")
+        names.append(f"W_ffn_gate_up_{layer_idx}_qparam")
+    return names
 
 
 def batch_packet_cache_names(config, batch_size: int) -> list[str]:
@@ -167,6 +186,82 @@ def _gemm(
         tile_m=tile_m,
         tile_k=BATCH_DECODE_GEMM_TILE_K,
         tile_n=tile_n,
+        context=context,
+    )
+
+
+def _paired_k_group_gemm(
+    context,
+    *,
+    rows: int,
+    k: int,
+    n: int,
+    tile_n: int = BATCH_DECODE_TRANSFORMER_TILE_N,
+) -> W4A16PairedKGroupGEMM:
+    tile_m = _gemm_tile_m(rows)
+    return W4A16PairedKGroupGEMM(
+        M=rows,
+        K=k,
+        N=n,
+        num_aie_columns=BATCH_DECODE_COLUMNS,
+        num_aie_rows=rows // tile_m,
+        tile_m=tile_m,
+        tile_k=BATCH_DECODE_GEMM_TILE_K,
+        tile_n=tile_n,
+        k_group=2,
+        context=context,
+    )
+
+
+def _k_group_gemm(
+    context,
+    *,
+    rows: int,
+    k: int,
+    n: int,
+    k_group: int = 2,
+    tile_n: int = BATCH_DECODE_TRANSFORMER_TILE_N,
+) -> W4A16KGroupGEMM:
+    tile_m = _gemm_tile_m(rows)
+    return W4A16KGroupGEMM(
+        M=rows,
+        K=k,
+        N=n,
+        num_aie_columns=BATCH_DECODE_COLUMNS,
+        num_aie_rows=rows // tile_m,
+        tile_m=tile_m,
+        tile_k=BATCH_DECODE_GEMM_TILE_K,
+        tile_n=tile_n,
+        k_group=k_group,
+        context=context,
+    )
+
+
+def _n_shard_rows(n: int, tile_n: int) -> int:
+    n_groups_per_col = n // (tile_n * BATCH_DECODE_COLUMNS)
+    for rows in (4, 3, 2, 1):
+        if n_groups_per_col % rows == 0:
+            return rows
+    raise ValueError(f"N={n} cannot be sharded across {BATCH_DECODE_COLUMNS} columns")
+
+
+def _lm_head_gemm(
+    context,
+    *,
+    rows: int,
+    k: int,
+    n: int,
+) -> W4A16NShardGEMM:
+    tile_m = _gemm_tile_m(rows)
+    return W4A16NShardGEMM(
+        M=rows,
+        K=k,
+        N=n,
+        num_aie_columns=BATCH_DECODE_COLUMNS,
+        num_aie_rows=_n_shard_rows(n, BATCH_DECODE_LM_HEAD_TILE_N),
+        tile_m=tile_m,
+        tile_k=BATCH_DECODE_GEMM_TILE_K,
+        tile_n=BATCH_DECODE_LM_HEAD_TILE_N,
         context=context,
     )
 
@@ -217,12 +312,14 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
     q_elements = decode_rows * attn_dim
     kv_elements = decode_rows * kv_dim
     ffn_elements = decode_rows * hidden_dim
+    logits_elements = decode_rows * config.lm_head_gemm_out_features
     packet_chunk_elements = 2 * DECODE_ATTN_CHUNK_SIZE * head_dim + DECODE_ATTN_CHUNK_SIZE
     packet_elements_per_group = (
         max_seq_len // DECODE_ATTN_CHUNK_SIZE * packet_chunk_elements
     )
     packet_elements = n_kv_groups * packet_elements_per_group
     hidden_norm_columns = min(BATCH_DECODE_COLUMNS, decode_rows)
+    rms_rope_columns = min(BATCH_DECODE_COLUMNS, decode_rows)
 
     current_cache_slot = max_seq_len - 1
     current_chunk = current_cache_slot // DECODE_ATTN_CHUNK_SIZE
@@ -244,49 +341,67 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
         weighted=True,
         context=context,
     )
-    attn_query_norm_op = RMSNorm(
-        size=q_elements,
-        num_aie_columns=BATCH_DECODE_COLUMNS,
-        num_channels=1,
-        tile_size=head_dim,
-        weighted=True,
-        context=context,
-    )
-    attn_key_norm_op = RMSNorm(
-        size=kv_elements,
-        num_aie_columns=BATCH_DECODE_COLUMNS,
-        num_channels=1,
-        tile_size=head_dim,
-        weighted=True,
-        context=context,
-    )
-    rope_queries_op = RoPE(
+    rms_rope_queries_op = RMSNormRoPE(
         rows=decode_rows * n_heads,
         cols=head_dim,
         angle_rows=decode_rows,
+        num_aie_columns=rms_rope_columns,
         context=context,
     )
-    rope_keys_op = RoPE(
+    rms_rope_keys_op = RMSNormRoPE(
         rows=decode_rows * n_kv_groups,
         cols=head_dim,
         angle_rows=decode_rows,
+        num_aie_columns=rms_rope_columns,
         context=context,
     )
-    gemm_attn_query_op = _gemm(context, rows=decode_rows, k=emb_dim, n=attn_dim)
-    gemm_attn_key_value_op = _gemm(context, rows=decode_rows, k=emb_dim, n=kv_dim)
-    gemm_attn_output_op = _gemm(context, rows=decode_rows, k=attn_dim, n=emb_dim)
-    gemm_ffn_up_gate_op = _gemm(context, rows=decode_rows, k=emb_dim, n=hidden_dim)
-    gemm_ffn_down_op = _gemm(context, rows=decode_rows, k=hidden_dim, n=emb_dim)
+    gemm_attn_query_op = _k_group_gemm(
+        context,
+        rows=decode_rows,
+        k=emb_dim,
+        n=attn_dim,
+        k_group=4,
+    )
+    gemm_attn_key_value_pair_op = _paired_k_group_gemm(
+        context,
+        rows=decode_rows,
+        k=emb_dim,
+        n=kv_dim,
+    )
+    gemm_attn_output_op = _k_group_gemm(
+        context,
+        rows=decode_rows,
+        k=attn_dim,
+        n=emb_dim,
+    )
+    gemm_ffn_up_gate_pair_op = _paired_k_group_gemm(
+        context,
+        rows=decode_rows,
+        k=emb_dim,
+        n=hidden_dim,
+    )
+    gemm_ffn_down_op = _k_group_gemm(
+        context,
+        rows=decode_rows,
+        k=hidden_dim,
+        n=emb_dim,
+    )
+    gemm_lm_head_op = _lm_head_gemm(
+        context,
+        rows=decode_rows,
+        k=emb_dim,
+        n=config.lm_head_gemm_out_features,
+    )
     silu_mul_ffn_op = SiLUMul(
         size=ffn_elements,
         tile_size=hidden_dim // BATCH_DECODE_COLUMNS,
         num_aie_columns=BATCH_DECODE_COLUMNS,
         context=context,
     )
-    residual_add_op = ElementwiseAdd(
+    residual_add_norm_op = ResidualAddRMSNorm(
         size=x_elements,
-        tile_size=emb_dim // BATCH_DECODE_COLUMNS,
-        num_aie_columns=BATCH_DECODE_COLUMNS,
+        tile_size=emb_dim,
+        num_aie_columns=hidden_norm_columns,
         context=context,
     )
     copy_present_packet_kv_op = CopyPresentPacketKV(
@@ -308,11 +423,10 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
         context=context,
     )
 
-    runlist = []
+    runlist = [(rms_norm_op, "x", "W_norm1_0", "x_norm")]
     for layer_idx in range(config.n_layers):
         runlist.extend(
             [
-                (rms_norm_op, "x", f"W_norm1_{layer_idx}", "x_norm"),
                 (
                     gemm_attn_query_op,
                     "x_norm",
@@ -320,31 +434,26 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
                     "queries",
                 ),
                 (
-                    gemm_attn_key_value_op,
+                    gemm_attn_key_value_pair_op,
                     "x_norm",
-                    _weight_arg(f"W_attn_key_{layer_idx}", specs),
+                    f"W_attn_key_value_{layer_idx}_qparam",
                     "keys",
-                ),
-                (
-                    gemm_attn_key_value_op,
-                    "x_norm",
-                    _weight_arg(f"W_attn_value_{layer_idx}", specs),
                     "values",
                 ),
                 (
-                    attn_query_norm_op,
+                    rms_rope_queries_op,
                     "queries",
                     f"W_attn_query_norm_{layer_idx}",
+                    "rope_angles",
                     "queries",
                 ),
                 (
-                    attn_key_norm_op,
+                    rms_rope_keys_op,
                     "keys",
                     f"W_attn_key_norm_{layer_idx}",
+                    "rope_angles",
                     "keys",
                 ),
-                (rope_queries_op, "queries", "rope_angles", "queries"),
-                (rope_keys_op, "keys", "rope_angles", "keys"),
             ]
         )
         for batch_idx in range(batch_size):
@@ -379,18 +488,19 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
                     _weight_arg(f"W_attn_output_decode_{layer_idx}", specs),
                     "attn_output",
                 ),
-                (residual_add_op, "x", "attn_output", "x"),
-                (rms_norm_op, "x", f"W_norm2_{layer_idx}", "x_norm"),
                 (
-                    gemm_ffn_up_gate_op,
+                    residual_add_norm_op,
+                    "x",
+                    "attn_output",
+                    f"W_norm2_{layer_idx}",
+                    "x",
                     "x_norm",
-                    _weight_arg(f"W_ffn_gate_{layer_idx}", specs),
-                    "ffn_gate",
                 ),
                 (
-                    gemm_ffn_up_gate_op,
+                    gemm_ffn_up_gate_pair_op,
                     "x_norm",
-                    _weight_arg(f"W_ffn_up_{layer_idx}", specs),
+                    f"W_ffn_gate_up_{layer_idx}_qparam",
+                    "ffn_gate",
                     "ffn_up",
                 ),
                 (silu_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
@@ -400,14 +510,36 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
                     _weight_arg(f"W_ffn_down_{layer_idx}", specs),
                     "ffn_output",
                 ),
-                (residual_add_op, "x", "ffn_output", "x"),
             ]
         )
+        next_norm_weight = (
+            f"W_norm1_{layer_idx + 1}"
+            if layer_idx + 1 < config.n_layers
+            else "W_final_norm"
+        )
+        next_norm_output = "x_norm" if layer_idx + 1 < config.n_layers else "hidden_out"
+        runlist.append(
+            (
+                residual_add_norm_op,
+                "x",
+                "ffn_output",
+                next_norm_weight,
+                "x",
+                next_norm_output,
+            )
+        )
 
-    runlist.append((rms_norm_op, "x", "W_final_norm", "hidden_out"))
+    runlist.append(
+        (
+            gemm_lm_head_op,
+            "hidden_out",
+            _weight_arg("W_out_head", specs),
+            "logits",
+        )
+    )
 
     output_args = [
-        "hidden_out",
+        "logits",
         *[
             present_key_name(layer_idx, batch_idx)
             for layer_idx in range(config.n_layers)
@@ -439,6 +571,7 @@ def build_batch_decode_fused_op(config, max_seq_len, batch_size, build_suffix):
                 "ffn_hidden": _bytes(ffn_elements),
                 "ffn_output": _bytes(x_elements),
                 "hidden_out": _bytes(x_elements),
+                "logits": _bytes(logits_elements),
                 **{
                     name: _bytes(packet_elements)
                     for name in batch_packet_cache_names(config, batch_size)

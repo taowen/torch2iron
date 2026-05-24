@@ -20,4 +20,4 @@ export NUM_TOKENS
 export BATCH_SIZE
 export PROMPT_LEN
 
-exec "$(dirname "${BASH_SOURCE[0]}")/run_exported_qwen3_batch_inference.sh" "$@"
+exec "$(dirname "${BASH_SOURCE[0]}")/run_quantized_qwen3_batch_inference.sh" "$@"
