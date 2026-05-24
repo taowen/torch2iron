@@ -12,20 +12,15 @@
 # [ ] Spatial fusion of operators
 
 import torch
-from pathlib import Path
-from models.exported_qwen3 import qwen_inference_harness as harness
-from models.exported_qwen3.aie_operators import AIEQwenOperators
-from models.exported_qwen3.decode_packet_cache import (
+from models.quantized_qwen3 import qwen_inference_harness as harness
+from models.quantized_qwen3.aie_operators import AIEQwenOperators
+from models.quantized_qwen3.decode_packet_cache import (
     append_decode_kv_cache,
     copy_decode_packet_cache_tokens,
     mark_decode_current_cache_slot,
 )
-from models.exported_qwen3.qwen_packed_weights import (
-    default_qwen_packed_weights_dir,
-    write_qwen_packed_weight_artifact,
-)
-from models.exported_qwen3.prefill_runtime import prefill_forward_pass
-from models.exported_qwen3.runtime_config import (
+from models.quantized_qwen3.prefill_runtime import prefill_forward_pass
+from models.quantized_qwen3.runtime_config import (
     select_compiled_seq_len,
     select_decode_context_len,
     select_decode_variant_seq_len,
@@ -171,22 +166,6 @@ def main():
         required_seq_len,
         prompt_tokens,
     )
-
-    packed_weights_dir = (
-        Path(args.packed_weights_dir)
-        if args.packed_weights_dir is not None
-        else default_qwen_packed_weights_dir(args.weights_path)
-    )
-    config.packed_weights_dir = packed_weights_dir
-    config.require_packed_weights = args.require_packed_weights
-
-    if args.prepare_weights:
-        manifest = write_qwen_packed_weight_artifact(config, packed_weights_dir)
-        print(f"packed_weights_dir: {packed_weights_dir}")
-        print(f"packed_weights_file: {packed_weights_dir / 'weights.bf16.bin'}")
-        print(f"packed_manifest_file: {packed_weights_dir / 'manifest.json'}")
-        print(f"packed_total_bytes: {manifest['total_bytes']}")
-        return
 
     runner = QwenNpuRunner(config, prefill_seq_len, max_seq_len)
 

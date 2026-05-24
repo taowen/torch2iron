@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import torch
 
-from models.exported_llama3.decode_packet_cache import (
+from models.quantized_qwen3.decode_packet_cache import (
     decode_packet_slot_offsets,
     sync_decode_packet_range,
 )
-from models.exported_llama3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
-from models.exported_llama3.runtime_config import DECODE_ATTN_CHUNK_SIZE
+from models.quantized_qwen3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
+from models.quantized_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
 def _clear_prefill_packet_masks(config, max_seq_len, fused):
@@ -78,10 +78,23 @@ def _append_prefill_chunk_to_packet_cache(
 
 def _run_lm_head_for_last_chunk(runner, hidden_out, valid_len):
     config = runner.config
-    source = getattr(config, "lm_head_weight_source", "model.embed_tokens.weight")
-    weight = config.weights[source]
-    x = hidden_out[valid_len - 1, :].to(dtype=weight.dtype)
-    return torch.mv(weight, x).view(1, 1, config.vocab_size)
+    fused = runner.aie_ops.prefill.lm_head_fused
+    fused.mark_buffer_dirty("input")
+    fused.get_buffer("x").torch_view()[:] = hidden_out[valid_len - 1, :]
+    fused()
+    return fused.get_buffer("logits").torch_view().view(1, 1, config.vocab_size)
+
+
+def _reset_prefill_dispatch_if_needed(prefill_ops):
+    fused = prefill_ops.fused
+    if not getattr(prefill_ops, "_prefill_dispatch_has_run", False):
+        return
+    fused.reload_elf(fused._elf_data)
+    fused.weight_buffer.to("npu")
+    fused.qparam_buffer.to("npu")
+    fused.kv_cache_buffer.to("npu")
+    fused.scratch_buffer.to("npu")
+    fused.output_buffer.to("npu")
 
 
 def prefill_forward_pass(runner, state):
@@ -123,7 +136,9 @@ def prefill_forward_pass(runner, state):
         x_input.zero_()
         x_input[:valid_len, :] = x[0, :, :]
 
+        _reset_prefill_dispatch_if_needed(prefill_ops)
         fused()
+        prefill_ops._prefill_dispatch_has_run = True
 
         for layer_idx in range(config.n_layers):
             _append_prefill_chunk_to_packet_cache(

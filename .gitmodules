@@ -2,3 +2,7 @@
 	path = third_party/IRON
 	url = https://github.com/amd/IRON.git
 	branch = devel
+[submodule "third_party/auto-round"]
+	path = third_party/auto-round
+	url = https://github.com/intel/auto-round.git
+	branch = main

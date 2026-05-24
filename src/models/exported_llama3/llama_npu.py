@@ -128,6 +128,7 @@ def _decode_forward_pass(runner, config, state):
     fused = variant.fused
 
     # Prefill RoPE angle look-up tables
+    fused.mark_buffer_dirty("input")
     angles_slice = config.angles[
         state.num_preceding_tokens : state.num_preceding_tokens + seq_len
     ]
@@ -139,7 +140,6 @@ def _decode_forward_pass(runner, config, state):
     fused.get_buffer("x").torch_view().view(-1, config.emb_dim)[:seq_len, :] = x
 
     # Fused NPU operator for all of decode (16 transformer blocks + final norm + final linear layer)
-    fused.input_buffer.to("cpu")
     fused()  # FusedFullELFCallable.__call__() syncs output_buffer to cpu
     append_decode_kv_cache(
         config,

@@ -37,6 +37,100 @@ from {{ model_package }}.generated.decode_layout import (
     EXPORTED_DECODE_CHUNK_SIZE,
 )
 from {{ model_package }}.runtime_config import DECODE_ATTN_CHUNK_SIZE
+{% if model_name == "quantized_qwen3" %}
+from {{ model_package }}.operators.w4a16_gemv.op import W4A16GEMV
+{% endif %}
+
+
+{% if model_name == "quantized_qwen3" %}
+DECODE_LINEAR_WEIGHT_PREFIXES = (
+    "W_attn_query_",
+    "W_attn_key_",
+    "W_attn_value_",
+    "W_attn_output_decode_",
+    "W_ffn_gate_",
+    "W_ffn_up_",
+    "W_ffn_down_",
+    "W_out_head",
+)
+
+
+def _is_decode_linear_weight(name: str) -> bool:
+    if name == "W_out_head":
+        return True
+    return any(
+        name.startswith(prefix) and name[len(prefix) :].isdigit()
+        for prefix in DECODE_LINEAR_WEIGHT_PREFIXES
+        if prefix != "W_out_head"
+    )
+
+
+def _weight_arg(name: str) -> str:
+    if _is_decode_linear_weight(name):
+        return f"{name}_qparam"
+    return name
+
+
+def _dense_transformer_weight_names() -> list[str]:
+    return [
+        name
+        for name in DECODE_TRANSFORMER_WEIGHT_NAMES
+        if not _is_decode_linear_weight(name)
+    ]
+
+
+def _qparam_weight_names() -> list[str]:
+    return [
+        f"{name}_qparam"
+        for name in (
+            *DECODE_TRANSFORMER_WEIGHT_NAMES,
+            *DECODE_LM_HEAD_WEIGHT_NAMES,
+        )
+        if _is_decode_linear_weight(name)
+    ]
+
+
+def _gemv(
+    *,
+    M,
+    K,
+    num_aie_columns,
+    tile_size_input,
+    tile_size_output,
+    context,
+):
+    return W4A16GEMV(
+        M=M,
+        K=K,
+        num_aie_columns=num_aie_columns,
+        tile_size_input=tile_size_input,
+        tile_size_output=tile_size_output,
+        group_size=128,
+        context=context,
+    )
+{% else %}
+def _weight_arg(name: str) -> str:
+    return name
+
+
+def _gemv(
+    *,
+    M,
+    K,
+    num_aie_columns,
+    tile_size_input,
+    tile_size_output,
+    context,
+):
+    return GEMV(
+        M=M,
+        K=K,
+        num_aie_columns=num_aie_columns,
+        tile_size_input=tile_size_input,
+        tile_size_output=tile_size_output,
+        context=context,
+    )
+{% endif %}
 
 
 def _decode_lm_head_tile_size_output(config) -> int:
@@ -86,7 +180,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
 
     elf_ctx = AIEContext(build_dir=Path("build_elf") / build_suffix)
 
-    gemv_attn_query_op = GEMV(
+    gemv_attn_query_op = _gemv(
         M=config.n_heads * config.head_dim,
         K=config.emb_dim,
         num_aie_columns=8,
@@ -95,7 +189,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         context=elf_ctx,
     )
 
-    gemv_attn_key_value_op = GEMV(
+    gemv_attn_key_value_op = _gemv(
         M=config.n_kv_groups * config.head_dim,
         K=config.emb_dim,
         num_aie_columns=8,
@@ -200,7 +294,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         context=elf_ctx,
     )
 
-    gemv_attn_output_op = GEMV(
+    gemv_attn_output_op = _gemv(
         M=config.emb_dim,
         K=config.n_heads * config.head_dim,
         num_aie_columns=8,
@@ -218,7 +312,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         context=elf_ctx,
     )
 
-    gemv_ffn_up_gate_op = GEMV(
+    gemv_ffn_up_gate_op = _gemv(
         M=config.hidden_dim,
         K=config.emb_dim,
         num_aie_columns=8,
@@ -227,7 +321,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         context=elf_ctx,
     )
 
-    gemv_ffn_down_op = GEMV(
+    gemv_ffn_down_op = _gemv(
         M=config.emb_dim,
         K=config.hidden_dim,
         num_aie_columns=8,
@@ -256,7 +350,7 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
         context=elf_ctx,
     )
 
-    gemv_out_head_op = GEMV(
+    gemv_out_head_op = _gemv(
         M=config.vocab_size,
         K=config.emb_dim,
         num_aie_columns=8,
@@ -270,17 +364,17 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
 {% for node in call_function_nodes(exported_program) %}
 {% set layer = layer_idx(node) %}
 {% if target_is(node, "aten.rms_norm.default") and path_endswith(node, "input_layernorm") %}
-        (rms_norm_op, "x", "W_norm1_{{ layer }}", "x_norm"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_{{ layer }}"), "x_norm"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.q_proj") %}
-        (gemv_attn_query_op, "W_attn_query_{{ layer }}", "x_norm", "queries"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_{{ layer }}"), "x_norm", "queries"),
 {% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.q_norm") %}
-        (attn_query_norm_op, "queries", "W_attn_query_norm_{{ layer }}", "queries"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_{{ layer }}"), "queries"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.k_proj") %}
-        (gemv_attn_key_value_op, "W_attn_key_{{ layer }}", "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_{{ layer }}"), "x_norm", "keys"),
 {% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.k_norm") %}
-        (attn_key_norm_op, "keys", "W_attn_key_norm_{{ layer }}", "keys"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_{{ layer }}"), "keys"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.v_proj") %}
-        (gemv_attn_key_value_op, "W_attn_value_{{ layer }}", "x_norm", "values"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_{{ layer }}"), "x_norm", "values"),
 {% elif target_is(node, "torch2iron.rope.default") and tensor_rank(node) == 5 %}
         (rope_queries_op, "queries", "rope_angles", "queries"),
 {% elif target_is(node, "torch2iron.rope.default") and tensor_rank(node) == 4 %}
@@ -292,26 +386,26 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
 {% elif target_is(node, "torch2iron.llama_chunked_attention.default") %}
         (llama_chunked_attention_op, "queries", "packet_cache_{{ layer }}", "attn_context"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.o_proj") %}
-        (gemv_attn_output_op, "W_attn_output_decode_{{ layer }}", "attn_context", "attn_output"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_{{ layer }}"), "attn_context", "attn_output"),
 {% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "self_attn.o_proj") %}
         (residual_add_op, "x", "attn_output", "x"),
 {% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "post_attention_layernorm") %}
-        (rms_norm_op, "x", "W_norm2_{{ layer }}", "x_norm"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_{{ layer }}"), "x_norm"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.gate_proj") %}
-        (gemv_ffn_up_gate_op, "W_ffn_gate_{{ layer }}", "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_{{ layer }}"), "x_norm", "ffn_gate"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.up_proj") %}
-        (gemv_ffn_up_gate_op, "W_ffn_up_{{ layer }}", "x_norm", "ffn_up"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_{{ layer }}"), "x_norm", "ffn_up"),
 {% elif target_is(node, "torch2iron.swiglu.default") %}
         (silu_ffn_op, "ffn_gate", "ffn_gate"),
         (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.down_proj") %}
-        (gemv_ffn_down_op, "W_ffn_down_{{ layer }}", "ffn_hidden", "ffn_output"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_{{ layer }}"), "ffn_hidden", "ffn_output"),
 {% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "mlp.down_proj") %}
         (residual_add_op, "x", "ffn_output", "x"),
 {% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "norm") and layer is none %}
         (rms_norm_op, "x", "W_final_norm", "hidden_out"),
 {% elif target_is(node, "aten.linear.default") and path_endswith(node, "lm_head") %}
-        (gemv_out_head_op, "W_out_head", "hidden_out", "logits"),
+        (gemv_out_head_op, _weight_arg("W_out_head"), "hidden_out", "logits"),
 {% endif %}
 {% endfor %}
     ]
@@ -325,8 +419,13 @@ def build_decode_fused_op(config, prompt_len, build_suffix):
             name: packet_cache_buffer_size for name in DECODE_PACKET_CACHE_NAMES
         },
         external_args={
+{% if model_name == "quantized_qwen3" %}
+            "weight": _dense_transformer_weight_names(),
+            "qparam": _qparam_weight_names(),
+{% else %}
             "weight": list(DECODE_TRANSFORMER_WEIGHT_NAMES),
             "lm_head": list(DECODE_LM_HEAD_WEIGHT_NAMES),
+{% endif %}
             "kv_cache": list(DECODE_PACKET_CACHE_NAMES),
         },
         context=elf_ctx,

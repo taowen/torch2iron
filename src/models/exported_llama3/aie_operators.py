@@ -115,6 +115,7 @@ class AIELlamaOperators:
             )
 
 def load_decode_weight_buffers(config, fused):
+    fused.mark_buffer_dirty("weight")
     packed_dir = getattr(config, "packed_weights_dir", None)
     require_packed = getattr(config, "require_packed_weights", False)
     manifest = None
@@ -145,6 +146,7 @@ def _copy_transposed_buffer(fused, name, tensor):
 
 
 def load_prefill_fused_weight_buffers(config, fused):
+    fused.mark_buffer_dirty("weight")
     for layer_idx in range(config.n_layers):
         prefix = f"model.layers.{layer_idx}"
         for name, source_suffix, transpose in PREFILL_LAYER_WEIGHT_SPECS:

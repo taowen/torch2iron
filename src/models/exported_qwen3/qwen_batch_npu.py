@@ -107,6 +107,7 @@ def _load_decode_weight_tensor(config, spec, manifest, packed_dir):
 
 
 def load_batch_decode_weight_buffers(config, fused):
+    fused.mark_buffer_dirty("weight")
     packed_dir = getattr(config, "packed_weights_dir", None)
     require_packed = getattr(config, "require_packed_weights", False)
     manifest = None
@@ -289,7 +290,7 @@ class QwenBatchNpuRunner:
 
         fused = self.batch_fused
         config = self.config
-        fused.input_buffer.to("cpu")
+        fused.mark_buffer_dirty("input")
 
         x_input = fused.get_buffer("x").torch_view().view(BATCH_DECODE_ROWS, config.emb_dim)
         x_input.zero_()

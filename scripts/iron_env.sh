@@ -15,7 +15,22 @@ if [[ -z "${IRON_PYTHON:-}" ]]; then
     fi
 fi
 
-XRT_ROOT="${XRT_ROOT:-/home/taowen/projects/xdna-driver/xrt/build/Release/opt/xilinx/xrt}"
+find_xrt_root() {
+    local candidate
+    for candidate in \
+        "${XILINX_XRT:-}" \
+        "/var/opt/xilinx/xrt" \
+        "/opt/xilinx/xrt" \
+        "/home/taowen/projects/xdna-driver/xrt/build/Release/opt/xilinx/xrt"; do
+        if [[ -n "${candidate}" && -d "${candidate}/python" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+XRT_ROOT="${XRT_ROOT:-$(find_xrt_root)}"
 XRT_PYTHONPATH="${XRT_PYTHONPATH:-${XRT_ROOT}/python}"
 
 require_path() {

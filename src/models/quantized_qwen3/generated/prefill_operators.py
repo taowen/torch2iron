@@ -3,10 +3,10 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generated fused prefill ELF builders for {{ model_name }}.
+"""Generated fused prefill ELF builders for quantized_qwen3.
 
 Regenerate with:
-    uv run python -m {{ codegen_module }} --model-package {{ model_package }}
+    uv run python -m torch2iron.export.codegen --model-package models.quantized_qwen3
 
 The model topology, layer count, and layer weight list come from
 torch.export.ExportedProgram. Runtime-specific tiling parameters still enter
@@ -31,15 +31,13 @@ from torch2iron.operators import (
     StridedCopy,
 )
 
-from {{ model_package }}.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
-from {{ model_package }}.generated.prefill_layout import (
+from models.quantized_qwen3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
+from models.quantized_qwen3.generated.prefill_layout import (
     EXPECTED_PREFILL_LAYERS,
     PREFILL_LAYER_WEIGHT_SPECS,
 )
-from {{ model_package }}.runtime_config import DECODE_ATTN_CHUNK_SIZE
-{% if model_name == "quantized_qwen3" %}
-from {{ model_package }}.operators.w4a16_gemm.op import W4A16GEMM
-{% endif %}
+from models.quantized_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
+from models.quantized_qwen3.operators.w4a16_gemm.op import W4A16GEMM
 
 
 BF16_BYTES = 2
@@ -62,7 +60,6 @@ def _prefill_gemm(
     b_col_maj=False,
     separate_c_tiles=False,
 ):
-{% if model_name == "quantized_qwen3" %}
     if b_col_maj or separate_c_tiles:
         raise ValueError("quantized prefill W4A16GEMM expects row-major tiled output")
     return W4A16GEMM(
@@ -75,21 +72,6 @@ def _prefill_gemm(
         group_size=config.group_size,
         context=context,
     )
-{% else %}
-    return GEMM(
-        M=query_len,
-        K=k,
-        N=n,
-        num_aie_columns=PREFILL_NUM_AIE_COLUMNS,
-        tile_m=PREFILL_CHUNK_GEMM_TILE_M,
-        tile_k=PREFILL_GEMM_TILE_SIZE,
-        tile_n=PREFILL_GEMM_TILE_SIZE,
-        b_col_maj=b_col_maj,
-        separate_c_tiles=separate_c_tiles,
-        emulate_bf16_mmul_with_bfp16=False,
-        context=context,
-    )
-{% endif %}
 
 
 def _strided_copy(
@@ -130,7 +112,6 @@ def _layer_weight_names(config) -> list[str]:
     return names
 
 
-{% if model_name == "quantized_qwen3" %}
 QUANTIZED_PREFILL_LINEAR_WEIGHTS = {
     name for name, _source_suffix, transpose in PREFILL_LAYER_WEIGHT_SPECS if transpose
 }
@@ -166,12 +147,6 @@ def _linear_qparam_names(config) -> list[str]:
     return names
 
 
-{% else %}
-def _weight_arg(name: str, layer_idx: int) -> str:
-    return f"{name}_{layer_idx}"
-
-
-{% endif %}
 def _present_key_name(layer_idx: int) -> str:
     return f"present_keys_{layer_idx}"
 
@@ -410,11 +385,7 @@ def build_prefill_fused_op(
 
     runlist = []
     for layer_idx in range(config.n_layers):
-{% set ns = namespace(rope_index=0) %}
-{% for node in representative_layer_nodes(exported_program) %}
-{% if target_is(node, "aten.rms_norm.default") and path_endswith(node, "input_layernorm") %}
         runlist.append((rms_norm_op, "x", _weight_arg("W_norm1", layer_idx), "x_norm"))
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.q_proj") %}
         runlist.append(
             (
                 attn_query_op,
@@ -423,16 +394,6 @@ def build_prefill_fused_op(
                 "queries",
             )
         )
-{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.q_norm") %}
-        runlist.append(
-            (
-                attn_query_norm_op,
-                "queries",
-                _weight_arg("W_attn_query_norm", layer_idx),
-                "queries",
-            )
-        )
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.k_proj") %}
         runlist.append(
             (
                 attn_key_value_op,
@@ -441,16 +402,6 @@ def build_prefill_fused_op(
                 "keys",
             )
         )
-{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "self_attn.k_norm") %}
-        runlist.append(
-            (
-                attn_key_norm_op,
-                "keys",
-                _weight_arg("W_attn_key_norm", layer_idx),
-                "keys",
-            )
-        )
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.v_proj") %}
         runlist.append(
             (
                 attn_key_value_op,
@@ -459,11 +410,23 @@ def build_prefill_fused_op(
                 "values",
             )
         )
-{% elif target_is(node, "torch2iron.rope.default") %}
-{% set ns.rope_index = ns.rope_index + 1 %}
-{% if ns.rope_index == 1 %}
+        runlist.append(
+            (
+                attn_query_norm_op,
+                "queries",
+                _weight_arg("W_attn_query_norm", layer_idx),
+                "queries",
+            )
+        )
+        runlist.append(
+            (
+                attn_key_norm_op,
+                "keys",
+                _weight_arg("W_attn_key_norm", layer_idx),
+                "keys",
+            )
+        )
         runlist.append((rope_queries_op, "queries", "rope_angles", "queries"))
-{% elif ns.rope_index == 2 %}
         runlist.extend(
             [
                 (rope_keys_op, "keys", "rope_angles", "keys"),
@@ -471,8 +434,6 @@ def build_prefill_fused_op(
                 (present_kv_copy_op, "values", _present_value_name(layer_idx)),
             ]
         )
-{% endif %}
-{% elif target_is(node, "aten.softmax.int") %}
         for q_block_idx in range(q_head_blocks_per_group):
             runlist.extend(
                 [
@@ -492,7 +453,6 @@ def build_prefill_fused_op(
                     ),
                 ]
             )
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "self_attn.o_proj") %}
         runlist.append(
             (
                 attn_output_op,
@@ -501,26 +461,20 @@ def build_prefill_fused_op(
                 "attn_output",
             )
         )
-{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "self_attn.o_proj") %}
         runlist.append((residual_add_op, "x", "attn_output", "x"))
-{% elif target_is(node, "aten.rms_norm.default") and path_endswith(node, "post_attention_layernorm") %}
         runlist.append((rms_norm_op, "x", _weight_arg("W_norm2", layer_idx), "x_norm"))
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.gate_proj") %}
         runlist.append(
             (ffn_up_gate_op, "x_norm", _weight_arg("W_ffn_gate_prefill", layer_idx), "ffn_gate")
         )
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.up_proj") %}
         runlist.append(
             (ffn_up_gate_op, "x_norm", _weight_arg("W_ffn_up_prefill", layer_idx), "ffn_up")
         )
-{% elif target_is(node, "torch2iron.swiglu.default") %}
         runlist.extend(
             [
                 (ffn_silu_op, "ffn_gate", "ffn_gate"),
                 (ffn_mul_op, "ffn_gate", "ffn_up", "ffn_hidden"),
             ]
         )
-{% elif target_is(node, "aten.linear.default") and path_endswith(node, "mlp.down_proj") %}
         runlist.append(
             (
                 ffn_down_op,
@@ -529,16 +483,9 @@ def build_prefill_fused_op(
                 "ffn_output",
             )
         )
-{% elif target_is(node, "aten.add.Tensor") and arg_path_endswith(node, 1, "mlp.down_proj") %}
         runlist.append((residual_add_op, "x", "ffn_output", "x"))
-{% endif %}
-{% endfor %}
 
-{% for node in call_function_nodes(exported_program) %}
-{% if target_is(node, "aten.rms_norm.default") and path_endswith(node, "norm") and layer_idx(node) is none %}
     runlist.append((rms_norm_op, "x", "W_final_norm", "hidden_out"))
-{% endif %}
-{% endfor %}
 
     output_args = [
         "hidden_out",
@@ -560,12 +507,8 @@ def build_prefill_fused_op(
             },
         },
         external_args={
-{% if model_name == "quantized_qwen3" %}
             "weight": _dense_weight_names(config),
             "qparam": _linear_qparam_names(config),
-{% else %}
-            "weight": _layer_weight_names(config),
-{% endif %}
             "kv_cache": list(DECODE_PACKET_CACHE_NAMES),
         },
         compile_mode="full_elf_dynamic",

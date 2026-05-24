@@ -10,6 +10,10 @@ dependencies = [
     "safetensors",
     "tiktoken",
     "jinja2",
+    "auto-round",
+    "iron",
+    "mlir-aie==0.0.1.2026033104+e4f35d6",
+    "llvm-aie==21.0.0.2026051101+adc9df1a",
 ]
 
 [build-system]
@@ -27,5 +31,19 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "mlir-aie-wheels"
+url = "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3"
+explicit = true
+
+[[tool.uv.index]]
+name = "llvm-aie-nightly"
+url = "https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly"
+explicit = true
+
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+auto-round = { path = "third_party/auto-round", editable = true }
+iron = { path = "third_party/IRON", editable = true }
+mlir-aie = { index = "mlir-aie-wheels" }
+llvm-aie = { index = "llvm-aie-nightly" }

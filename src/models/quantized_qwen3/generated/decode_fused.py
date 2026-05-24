@@ -1,0 +1,973 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generated decode fused operator for quantized_qwen3.
+
+Regenerate with:
+    uv run python -m torch2iron.export.codegen --model-package models.quantized_qwen3
+
+The generator renders this file directly from torch.export.ExportedProgram.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from iron.common.context import AIEContext
+from torch2iron.fusion import FusedMLIROperator
+from torch2iron.operators import (
+    ElementwiseAdd,
+    ElementwiseMul,
+    GEMV,
+    LlamaChunkedAttention,
+    RMSNorm,
+    RoPE,
+    SiLU,
+    StridedCopy,
+)
+
+from models.quantized_qwen3.generated.decode_layout import (
+    DECODE_LM_HEAD_WEIGHT_NAMES,
+    DECODE_OUTPUT_ARGS,
+    DECODE_PACKET_CACHE_NAMES,
+    DECODE_TRANSFORMER_WEIGHT_NAMES,
+    EXPECTED_DECODE_LAYERS,
+    EXPORTED_DECODE_CHUNK_SIZE,
+)
+from models.quantized_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
+from models.quantized_qwen3.operators.w4a16_gemv.op import W4A16GEMV
+
+
+DECODE_LINEAR_WEIGHT_PREFIXES = (
+    "W_attn_query_",
+    "W_attn_key_",
+    "W_attn_value_",
+    "W_attn_output_decode_",
+    "W_ffn_gate_",
+    "W_ffn_up_",
+    "W_ffn_down_",
+    "W_out_head",
+)
+
+
+def _is_decode_linear_weight(name: str) -> bool:
+    if name == "W_out_head":
+        return True
+    return any(
+        name.startswith(prefix) and name[len(prefix) :].isdigit()
+        for prefix in DECODE_LINEAR_WEIGHT_PREFIXES
+        if prefix != "W_out_head"
+    )
+
+
+def _weight_arg(name: str) -> str:
+    if _is_decode_linear_weight(name):
+        return f"{name}_qparam"
+    return name
+
+
+def _dense_transformer_weight_names() -> list[str]:
+    return [
+        name
+        for name in DECODE_TRANSFORMER_WEIGHT_NAMES
+        if not _is_decode_linear_weight(name)
+    ]
+
+
+def _qparam_weight_names() -> list[str]:
+    return [
+        f"{name}_qparam"
+        for name in (
+            *DECODE_TRANSFORMER_WEIGHT_NAMES,
+            *DECODE_LM_HEAD_WEIGHT_NAMES,
+        )
+        if _is_decode_linear_weight(name)
+    ]
+
+
+def _gemv(
+    *,
+    M,
+    K,
+    num_aie_columns,
+    tile_size_input,
+    tile_size_output,
+    context,
+):
+    return W4A16GEMV(
+        M=M,
+        K=K,
+        num_aie_columns=num_aie_columns,
+        tile_size_input=tile_size_input,
+        tile_size_output=tile_size_output,
+        group_size=128,
+        context=context,
+    )
+
+
+def _decode_lm_head_tile_size_output(config) -> int:
+    rows_per_column = config.vocab_size // 8
+    preferred_tile_sizes = (
+        (8, 16, 4, 32) if config.head_dim >= 128 else (32, 16, 8, 4)
+    )
+    for tile_size_output in preferred_tile_sizes:
+        if rows_per_column % tile_size_output == 0:
+            return tile_size_output
+    raise ValueError(
+        "decode lm_head vocab rows per AIE column must be divisible by 4, 8, 16, or 32"
+    )
+
+
+def _decode_attn_key_value_tile_size_input(config) -> int:
+    return 8 if config.head_dim >= 128 else 4
+
+
+def _decode_attn_key_value_tile_size_output(config) -> int:
+    return config.head_dim if config.head_dim >= 128 else config.head_dim // 2
+
+
+def _decode_attn_output_tile_size_input(config) -> int:
+    return 2 if config.head_dim >= 128 else 4
+
+
+def _decode_ffn_up_gate_tile_size_input(config) -> int:
+    return 2 if config.head_dim >= 128 else 4
+
+
+def _decode_lm_head_tile_size_input(config) -> int:
+    return 8 if config.head_dim >= 128 else 4
+
+
+def build_decode_fused_op(config, prompt_len, build_suffix):
+    if config.n_layers != EXPECTED_DECODE_LAYERS:
+        raise ValueError(
+            f"generated decode graph expects {EXPECTED_DECODE_LAYERS} layers, "
+            f"got {config.n_layers}"
+        )
+    if DECODE_ATTN_CHUNK_SIZE != EXPORTED_DECODE_CHUNK_SIZE:
+        raise ValueError(
+            f"generated decode graph expects chunk size {EXPORTED_DECODE_CHUNK_SIZE}, "
+            f"got {DECODE_ATTN_CHUNK_SIZE}"
+        )
+
+    elf_ctx = AIEContext(build_dir=Path("build_elf") / build_suffix)
+
+    gemv_attn_query_op = _gemv(
+        M=config.n_heads * config.head_dim,
+        K=config.emb_dim,
+        num_aie_columns=8,
+        tile_size_input=4,
+        tile_size_output=config.head_dim // 2,
+        context=elf_ctx,
+    )
+
+    gemv_attn_key_value_op = _gemv(
+        M=config.n_kv_groups * config.head_dim,
+        K=config.emb_dim,
+        num_aie_columns=8,
+        tile_size_input=_decode_attn_key_value_tile_size_input(config),
+        tile_size_output=_decode_attn_key_value_tile_size_output(config),
+        context=elf_ctx,
+    )
+
+    rope_queries_op = RoPE(
+        rows=config.n_heads,
+        cols=config.head_dim,
+        angle_rows=1,
+        context=elf_ctx,
+    )
+    rope_keys_op = RoPE(
+        rows=config.n_kv_groups,
+        cols=config.head_dim,
+        angle_rows=1,
+        context=elf_ctx,
+    )
+    attn_query_norm_op = RMSNorm(
+        size=config.n_heads * config.head_dim,
+        num_aie_columns=8,
+        num_channels=1,
+        tile_size=config.head_dim,
+        weighted=True,
+        context=elf_ctx,
+    )
+    attn_key_norm_op = RMSNorm(
+        size=config.n_kv_groups * config.head_dim,
+        num_aie_columns=8,
+        num_channels=1,
+        tile_size=config.head_dim,
+        weighted=True,
+        context=elf_ctx,
+    )
+
+    current_cache_slot = prompt_len - 1
+    packet_chunk_elements = (
+        2 * DECODE_ATTN_CHUNK_SIZE * config.head_dim + DECODE_ATTN_CHUNK_SIZE
+    )
+    packet_elements_per_group = (
+        prompt_len // DECODE_ATTN_CHUNK_SIZE * packet_chunk_elements
+    )
+    packet_elements = config.n_kv_groups * packet_elements_per_group
+    current_chunk = current_cache_slot // DECODE_ATTN_CHUNK_SIZE
+    current_row = current_cache_slot % DECODE_ATTN_CHUNK_SIZE
+    current_k_packet_offset = (
+        current_chunk * packet_chunk_elements + current_row * config.head_dim
+    )
+    current_v_packet_offset = (
+        current_chunk * packet_chunk_elements
+        + DECODE_ATTN_CHUNK_SIZE * config.head_dim
+        + current_row * config.head_dim
+    )
+
+    strided_copy_packet_key_op = StridedCopy(
+        input_sizes=(config.n_kv_groups, config.head_dim),
+        input_strides=(config.head_dim, 1),
+        input_offset=0,
+        output_sizes=(config.n_kv_groups, config.head_dim),
+        output_strides=(packet_elements_per_group, 1),
+        output_offset=current_k_packet_offset,
+        input_buffer_size=config.n_kv_groups * config.head_dim,
+        output_buffer_size=packet_elements,
+        num_aie_channels=1,
+        context=elf_ctx,
+    )
+
+    strided_copy_packet_value_op = StridedCopy(
+        input_sizes=(config.n_kv_groups, config.head_dim),
+        input_strides=(config.head_dim, 1),
+        input_offset=0,
+        output_sizes=(config.n_kv_groups, config.head_dim),
+        output_strides=(packet_elements_per_group, 1),
+        output_offset=current_v_packet_offset,
+        input_buffer_size=config.n_kv_groups * config.head_dim,
+        output_buffer_size=packet_elements,
+        num_aie_channels=1,
+        context=elf_ctx,
+    )
+
+    copy_present_kv_op = StridedCopy(
+        input_sizes=(config.n_kv_groups, config.head_dim),
+        input_strides=(config.head_dim, 1),
+        input_offset=0,
+        output_sizes=(config.n_kv_groups, config.head_dim),
+        output_strides=(config.head_dim, 1),
+        output_offset=0,
+        input_buffer_size=config.n_kv_groups * config.head_dim,
+        output_buffer_size=config.n_kv_groups * config.head_dim,
+        num_aie_channels=1,
+        context=elf_ctx,
+    )
+
+    llama_chunked_attention_op = LlamaChunkedAttention(
+        max_seq_len=prompt_len,
+        num_kv_groups=config.n_kv_groups,
+        q_heads_per_group=config.n_heads // config.n_kv_groups,
+        head_dim=config.head_dim,
+        chunk_size=DECODE_ATTN_CHUNK_SIZE,
+        context=elf_ctx,
+    )
+
+    gemv_attn_output_op = _gemv(
+        M=config.emb_dim,
+        K=config.n_heads * config.head_dim,
+        num_aie_columns=8,
+        tile_size_input=_decode_attn_output_tile_size_input(config),
+        tile_size_output=config.emb_dim // 8,
+        context=elf_ctx,
+    )
+
+    rms_norm_op = RMSNorm(
+        size=config.emb_dim,
+        num_aie_columns=1,
+        num_channels=1,
+        tile_size=config.emb_dim,
+        weighted=True,
+        context=elf_ctx,
+    )
+
+    gemv_ffn_up_gate_op = _gemv(
+        M=config.hidden_dim,
+        K=config.emb_dim,
+        num_aie_columns=8,
+        tile_size_input=_decode_ffn_up_gate_tile_size_input(config),
+        tile_size_output=config.hidden_dim // 8,
+        context=elf_ctx,
+    )
+
+    gemv_ffn_down_op = _gemv(
+        M=config.emb_dim,
+        K=config.hidden_dim,
+        num_aie_columns=8,
+        tile_size_input=1,
+        tile_size_output=config.emb_dim // 8,
+        context=elf_ctx,
+    )
+
+    silu_ffn_op = SiLU(
+        size=config.hidden_dim,
+        tile_size=config.hidden_dim // 8,
+        num_aie_columns=8,
+        context=elf_ctx,
+    )
+
+    eltwise_mul_ffn_op = ElementwiseMul(
+        size=config.hidden_dim,
+        tile_size=config.hidden_dim // 8,
+        num_aie_columns=8,
+        context=elf_ctx,
+    )
+
+    residual_add_op = ElementwiseAdd(
+        size=config.emb_dim,
+        tile_size=config.emb_dim // 8,
+        context=elf_ctx,
+    )
+
+    gemv_out_head_op = _gemv(
+        M=config.vocab_size,
+        K=config.emb_dim,
+        num_aie_columns=8,
+        tile_size_input=_decode_lm_head_tile_size_input(config),
+        tile_size_output=_decode_lm_head_tile_size_output(config),
+        context=elf_ctx,
+    )
+
+    packet_cache_buffer_size = packet_elements * 2
+    runlist = [
+        (rms_norm_op, "x", _weight_arg("W_norm1_0"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_0"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_0"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_0"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_0"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_0"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_0"),
+        (copy_present_kv_op, "values", "present_values_0"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_0"),
+        (strided_copy_packet_value_op, "values", "packet_cache_0"),
+        (llama_chunked_attention_op, "queries", "packet_cache_0", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_0"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_0"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_0"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_0"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_0"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_1"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_1"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_1"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_1"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_1"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_1"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_1"),
+        (copy_present_kv_op, "values", "present_values_1"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_1"),
+        (strided_copy_packet_value_op, "values", "packet_cache_1"),
+        (llama_chunked_attention_op, "queries", "packet_cache_1", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_1"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_1"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_1"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_1"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_1"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_2"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_2"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_2"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_2"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_2"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_2"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_2"),
+        (copy_present_kv_op, "values", "present_values_2"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_2"),
+        (strided_copy_packet_value_op, "values", "packet_cache_2"),
+        (llama_chunked_attention_op, "queries", "packet_cache_2", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_2"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_2"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_2"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_2"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_2"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_3"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_3"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_3"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_3"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_3"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_3"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_3"),
+        (copy_present_kv_op, "values", "present_values_3"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_3"),
+        (strided_copy_packet_value_op, "values", "packet_cache_3"),
+        (llama_chunked_attention_op, "queries", "packet_cache_3", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_3"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_3"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_3"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_3"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_3"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_4"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_4"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_4"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_4"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_4"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_4"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_4"),
+        (copy_present_kv_op, "values", "present_values_4"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_4"),
+        (strided_copy_packet_value_op, "values", "packet_cache_4"),
+        (llama_chunked_attention_op, "queries", "packet_cache_4", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_4"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_4"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_4"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_4"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_4"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_5"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_5"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_5"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_5"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_5"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_5"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_5"),
+        (copy_present_kv_op, "values", "present_values_5"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_5"),
+        (strided_copy_packet_value_op, "values", "packet_cache_5"),
+        (llama_chunked_attention_op, "queries", "packet_cache_5", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_5"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_5"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_5"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_5"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_5"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_6"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_6"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_6"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_6"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_6"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_6"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_6"),
+        (copy_present_kv_op, "values", "present_values_6"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_6"),
+        (strided_copy_packet_value_op, "values", "packet_cache_6"),
+        (llama_chunked_attention_op, "queries", "packet_cache_6", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_6"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_6"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_6"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_6"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_6"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_7"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_7"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_7"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_7"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_7"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_7"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_7"),
+        (copy_present_kv_op, "values", "present_values_7"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_7"),
+        (strided_copy_packet_value_op, "values", "packet_cache_7"),
+        (llama_chunked_attention_op, "queries", "packet_cache_7", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_7"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_7"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_7"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_7"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_7"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_8"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_8"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_8"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_8"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_8"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_8"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_8"),
+        (copy_present_kv_op, "values", "present_values_8"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_8"),
+        (strided_copy_packet_value_op, "values", "packet_cache_8"),
+        (llama_chunked_attention_op, "queries", "packet_cache_8", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_8"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_8"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_8"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_8"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_8"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_9"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_9"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_9"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_9"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_9"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_9"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_9"),
+        (copy_present_kv_op, "values", "present_values_9"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_9"),
+        (strided_copy_packet_value_op, "values", "packet_cache_9"),
+        (llama_chunked_attention_op, "queries", "packet_cache_9", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_9"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_9"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_9"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_9"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_9"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_10"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_10"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_10"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_10"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_10"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_10"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_10"),
+        (copy_present_kv_op, "values", "present_values_10"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_10"),
+        (strided_copy_packet_value_op, "values", "packet_cache_10"),
+        (llama_chunked_attention_op, "queries", "packet_cache_10", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_10"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_10"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_10"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_10"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_10"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_11"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_11"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_11"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_11"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_11"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_11"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_11"),
+        (copy_present_kv_op, "values", "present_values_11"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_11"),
+        (strided_copy_packet_value_op, "values", "packet_cache_11"),
+        (llama_chunked_attention_op, "queries", "packet_cache_11", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_11"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_11"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_11"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_11"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_11"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_12"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_12"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_12"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_12"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_12"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_12"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_12"),
+        (copy_present_kv_op, "values", "present_values_12"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_12"),
+        (strided_copy_packet_value_op, "values", "packet_cache_12"),
+        (llama_chunked_attention_op, "queries", "packet_cache_12", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_12"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_12"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_12"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_12"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_12"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_13"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_13"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_13"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_13"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_13"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_13"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_13"),
+        (copy_present_kv_op, "values", "present_values_13"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_13"),
+        (strided_copy_packet_value_op, "values", "packet_cache_13"),
+        (llama_chunked_attention_op, "queries", "packet_cache_13", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_13"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_13"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_13"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_13"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_13"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_14"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_14"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_14"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_14"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_14"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_14"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_14"),
+        (copy_present_kv_op, "values", "present_values_14"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_14"),
+        (strided_copy_packet_value_op, "values", "packet_cache_14"),
+        (llama_chunked_attention_op, "queries", "packet_cache_14", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_14"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_14"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_14"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_14"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_14"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_15"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_15"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_15"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_15"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_15"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_15"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_15"),
+        (copy_present_kv_op, "values", "present_values_15"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_15"),
+        (strided_copy_packet_value_op, "values", "packet_cache_15"),
+        (llama_chunked_attention_op, "queries", "packet_cache_15", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_15"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_15"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_15"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_15"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_15"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_16"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_16"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_16"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_16"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_16"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_16"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_16"),
+        (copy_present_kv_op, "values", "present_values_16"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_16"),
+        (strided_copy_packet_value_op, "values", "packet_cache_16"),
+        (llama_chunked_attention_op, "queries", "packet_cache_16", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_16"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_16"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_16"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_16"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_16"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_17"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_17"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_17"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_17"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_17"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_17"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_17"),
+        (copy_present_kv_op, "values", "present_values_17"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_17"),
+        (strided_copy_packet_value_op, "values", "packet_cache_17"),
+        (llama_chunked_attention_op, "queries", "packet_cache_17", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_17"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_17"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_17"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_17"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_17"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_18"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_18"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_18"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_18"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_18"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_18"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_18"),
+        (copy_present_kv_op, "values", "present_values_18"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_18"),
+        (strided_copy_packet_value_op, "values", "packet_cache_18"),
+        (llama_chunked_attention_op, "queries", "packet_cache_18", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_18"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_18"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_18"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_18"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_18"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_19"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_19"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_19"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_19"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_19"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_19"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_19"),
+        (copy_present_kv_op, "values", "present_values_19"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_19"),
+        (strided_copy_packet_value_op, "values", "packet_cache_19"),
+        (llama_chunked_attention_op, "queries", "packet_cache_19", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_19"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_19"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_19"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_19"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_19"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_20"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_20"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_20"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_20"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_20"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_20"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_20"),
+        (copy_present_kv_op, "values", "present_values_20"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_20"),
+        (strided_copy_packet_value_op, "values", "packet_cache_20"),
+        (llama_chunked_attention_op, "queries", "packet_cache_20", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_20"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_20"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_20"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_20"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_20"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_21"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_21"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_21"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_21"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_21"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_21"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_21"),
+        (copy_present_kv_op, "values", "present_values_21"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_21"),
+        (strided_copy_packet_value_op, "values", "packet_cache_21"),
+        (llama_chunked_attention_op, "queries", "packet_cache_21", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_21"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_21"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_21"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_21"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_21"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_22"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_22"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_22"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_22"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_22"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_22"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_22"),
+        (copy_present_kv_op, "values", "present_values_22"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_22"),
+        (strided_copy_packet_value_op, "values", "packet_cache_22"),
+        (llama_chunked_attention_op, "queries", "packet_cache_22", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_22"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_22"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_22"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_22"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_22"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_23"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_23"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_23"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_23"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_23"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_23"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_23"),
+        (copy_present_kv_op, "values", "present_values_23"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_23"),
+        (strided_copy_packet_value_op, "values", "packet_cache_23"),
+        (llama_chunked_attention_op, "queries", "packet_cache_23", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_23"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_23"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_23"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_23"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_23"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_24"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_24"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_24"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_24"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_24"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_24"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_24"),
+        (copy_present_kv_op, "values", "present_values_24"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_24"),
+        (strided_copy_packet_value_op, "values", "packet_cache_24"),
+        (llama_chunked_attention_op, "queries", "packet_cache_24", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_24"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_24"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_24"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_24"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_24"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_25"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_25"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_25"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_25"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_25"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_25"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_25"),
+        (copy_present_kv_op, "values", "present_values_25"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_25"),
+        (strided_copy_packet_value_op, "values", "packet_cache_25"),
+        (llama_chunked_attention_op, "queries", "packet_cache_25", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_25"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_25"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_25"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_25"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_25"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_26"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_26"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_26"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_26"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_26"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_26"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_26"),
+        (copy_present_kv_op, "values", "present_values_26"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_26"),
+        (strided_copy_packet_value_op, "values", "packet_cache_26"),
+        (llama_chunked_attention_op, "queries", "packet_cache_26", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_26"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_26"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_26"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_26"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_26"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm1_27"), "x_norm"),
+        (gemv_attn_query_op, _weight_arg("W_attn_query_27"), "x_norm", "queries"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_key_27"), "x_norm", "keys"),
+        (gemv_attn_key_value_op, _weight_arg("W_attn_value_27"), "x_norm", "values"),
+        (attn_query_norm_op, "queries", _weight_arg("W_attn_query_norm_27"), "queries"),
+        (attn_key_norm_op, "keys", _weight_arg("W_attn_key_norm_27"), "keys"),
+        (rope_queries_op, "queries", "rope_angles", "queries"),
+        (rope_keys_op, "keys", "rope_angles", "keys"),
+        (copy_present_kv_op, "keys", "present_keys_27"),
+        (copy_present_kv_op, "values", "present_values_27"),
+        (strided_copy_packet_key_op, "keys", "packet_cache_27"),
+        (strided_copy_packet_value_op, "values", "packet_cache_27"),
+        (llama_chunked_attention_op, "queries", "packet_cache_27", "attn_context"),
+        (gemv_attn_output_op, _weight_arg("W_attn_output_decode_27"), "attn_context", "attn_output"),
+        (residual_add_op, "x", "attn_output", "x"),
+        (rms_norm_op, "x", _weight_arg("W_norm2_27"), "x_norm"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_gate_27"), "x_norm", "ffn_gate"),
+        (gemv_ffn_up_gate_op, _weight_arg("W_ffn_up_27"), "x_norm", "ffn_up"),
+        (silu_ffn_op, "ffn_gate", "ffn_gate"),
+        (eltwise_mul_ffn_op, "ffn_gate", "ffn_up", "ffn_hidden"),
+        (gemv_ffn_down_op, _weight_arg("W_ffn_down_27"), "ffn_hidden", "ffn_output"),
+        (residual_add_op, "x", "ffn_output", "x"),
+        (rms_norm_op, "x", "W_final_norm", "hidden_out"),
+        (gemv_out_head_op, _weight_arg("W_out_head"), "hidden_out", "logits"),
+    ]
+
+    fused_op = FusedMLIROperator(
+        "fused_op",
+        runlist,
+        input_args=["x", "rope_angles"],
+        output_args=list(DECODE_OUTPUT_ARGS),
+        buffer_sizes={
+            name: packet_cache_buffer_size for name in DECODE_PACKET_CACHE_NAMES
+        },
+        external_args={
+            "weight": _dense_transformer_weight_names(),
+            "qparam": _qparam_weight_names(),
+            "kv_cache": list(DECODE_PACKET_CACHE_NAMES),
+        },
+        context=elf_ctx,
+    ).compile()
+    return fused_op, current_cache_slot

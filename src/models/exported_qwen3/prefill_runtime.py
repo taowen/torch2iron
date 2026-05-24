@@ -14,13 +14,25 @@ from models.exported_qwen3.decode_packet_cache import (
     sync_decode_packet_range,
 )
 from models.exported_qwen3.generated.decode_layout import DECODE_PACKET_CACHE_NAMES
+from models.exported_qwen3.runtime_config import DECODE_ATTN_CHUNK_SIZE
 
 
-def _zero_prefill_packet_caches(config, fused):
+def _clear_prefill_packet_masks(config, max_seq_len, fused):
     for layer_idx in range(config.n_layers):
         packet_cache = fused.get_buffer(DECODE_PACKET_CACHE_NAMES[layer_idx])
-        packet_cache.torch_view().zero_()
-        packet_cache.to("npu")
+        packet = packet_cache.torch_view()
+        for group_idx in range(config.n_kv_groups):
+            for slot in range(0, max_seq_len, DECODE_ATTN_CHUNK_SIZE):
+                _k_offset, _v_offset, mask_offset = decode_packet_slot_offsets(
+                    config,
+                    max_seq_len,
+                    group_idx,
+                    slot,
+                    DECODE_ATTN_CHUNK_SIZE,
+                )
+                rows = min(DECODE_ATTN_CHUNK_SIZE, max_seq_len - slot)
+                packet[mask_offset : mask_offset + rows] = 0.0
+                sync_decode_packet_range(packet_cache, mask_offset, rows)
 
 
 def _append_prefill_chunk_to_packet_cache(
@@ -87,7 +99,7 @@ def prefill_forward_pass(runner, state):
     if state.num_preceding_tokens:
         raise NotImplementedError("chunked fused prefill only supports first prefill")
 
-    _zero_prefill_packet_caches(config, fused)
+    _clear_prefill_packet_masks(config, max_seq_len, fused)
 
     tok_emb_weight = config.weights["model.embed_tokens.weight"]
     last_logits = None
@@ -96,6 +108,7 @@ def prefill_forward_pass(runner, state):
         valid_len = min(chunk_size, seq_len - chunk_start)
         chunk_end = chunk_start + valid_len
 
+        fused.mark_buffer_dirty("input")
         rope_angles = fused.get_buffer("rope_angles").torch_view().view(
             compute_rows, config.head_dim
         )

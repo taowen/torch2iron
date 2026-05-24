@@ -86,6 +86,7 @@ def _write_fused_mlir(
     runlist: list[tuple[str, ...]],
     subbuffer_layout: dict[str, tuple[str, int, int]],
     buffer_sizes: dict[str, int],
+    buffer_dtypes: dict[str, Any],
     buffer_order: list[str],
     runtime_buffer_order: list[str],
     slice_info: dict[str, tuple[str, int, int]],
@@ -119,8 +120,6 @@ def _write_fused_mlir(
 
         @aie.device(device_ty)
         def main():
-            buf_dtype = np.dtype[ml_dtypes.bfloat16]
-            itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
             sequence_types = []
             for name in runtime_buffer_order:
                 if name == "trace":
@@ -130,8 +129,13 @@ def _write_fused_mlir(
                 elif name.startswith("trace_filler_"):
                     sequence_types.append(np.ndarray[(1,), np.dtype[np.uint32]])
                 else:
+                    buf_dtype = np.dtype(buffer_dtypes[name])
+                    itemsize = buf_dtype.itemsize
                     sequence_types.append(
-                        np.ndarray[(buffer_sizes[name] // itemsize,), buf_dtype]
+                        np.ndarray[
+                            (buffer_sizes[name] // itemsize,),
+                            np.dtype[buf_dtype.type],
+                        ]
                     )
 
             def emit_sequence(runtime_buffers):
@@ -166,6 +170,7 @@ def _write_fused_mlir(
                                 buf_type, offset, length = subbuffer_layout[buf_name]
 
                             consolidated_buf = consolidated_buffers[buf_type]
+                            itemsize = np.dtype(buffer_dtypes[buf_type]).itemsize
                             offset_elements = offset // itemsize
                             size_elements = length // itemsize
                             subview = memref.subview(
@@ -193,7 +198,7 @@ def _write_fused_mlir(
                                 strides.insert(0, stride)
                                 stride *= dim
                             result_type = ir.MemRefType.get(
-                                target_shape, ir.BF16Type.get()
+                                target_shape, expected_memref.element_type
                             )
                             reinterpreted = memref.reinterpret_cast(
                                 result=result_type,
@@ -259,6 +264,7 @@ def _fused_mlir_signature(
     runlist: list[tuple[str, ...]],
     subbuffer_layout: dict[str, tuple[str, int, int]],
     buffer_sizes: dict[str, int],
+    buffer_dtypes: dict[str, Any],
     buffer_order: list[str],
     runtime_buffer_order: list[str],
     slice_info: dict[str, tuple[str, int, int]],
@@ -285,6 +291,9 @@ def _fused_mlir_signature(
         "runlist": runlist,
         "subbuffer_layout": subbuffer_layout,
         "buffer_sizes": buffer_sizes,
+        "buffer_dtypes": {
+            name: str(np.dtype(dtype)) for name, dtype in buffer_dtypes.items()
+        },
         "buffer_order": buffer_order,
         "runtime_buffer_order": runtime_buffer_order,
         "slice_info": slice_info,
@@ -452,6 +461,7 @@ class FusedMLIROperator(AIEOperatorBase):
     def _calculate_buffer_layout(self):
         args = {}
         sliced_buffers = {}
+        buffer_dtypes = {}
 
         for op, *bufs in self.runlist:
             arg_specs = op.get_arg_spec()
@@ -503,16 +513,31 @@ class FusedMLIROperator(AIEOperatorBase):
         subbuffer_layout = {}
         slice_info = {}
 
+        def set_buffer_dtype(buffer_type, dtype):
+            dtype = np.dtype(dtype)
+            if (
+                buffer_type in buffer_dtypes
+                and np.dtype(buffer_dtypes[buffer_type]) != dtype
+            ):
+                raise ValueError(
+                    f"Fused buffer type {buffer_type!r} mixes dtypes "
+                    f"{buffer_dtypes[buffer_type]} and {dtype}"
+                )
+            buffer_dtypes[buffer_type] = dtype
+
         def add_buffers(buffer_type, args_list):
             offset = 0
             for arg in args_list:
                 if arg in self.explicit_buffer_sizes:
                     length = self.explicit_buffer_sizes[arg]
+                    dtype = ml_dtypes.bfloat16
                 elif arg in args:
                     spec = args[arg]
                     length = int(np.prod(spec.shape) * np.dtype(spec.dtype).itemsize)
+                    dtype = spec.dtype
                 else:
                     continue
+                set_buffer_dtype(buffer_type, dtype)
                 subbuffer_layout[arg] = (buffer_type, offset, length)
                 offset += length
             return offset
@@ -536,12 +561,15 @@ class FusedMLIROperator(AIEOperatorBase):
             if explicit_buf not in assigned and explicit_buf not in scratch_args:
                 scratch_args.append(explicit_buf)
         buffer_sizes["scratch"] = add_buffers("scratch", scratch_args)
+        for name in self.buffer_order:
+            buffer_dtypes.setdefault(name, np.dtype(ml_dtypes.bfloat16))
 
         ordered_sizes = {name: buffer_sizes[name] for name in self.buffer_order}
-        return subbuffer_layout, ordered_sizes, slice_info
+        ordered_dtypes = {name: buffer_dtypes[name] for name in self.buffer_order}
+        return subbuffer_layout, ordered_sizes, ordered_dtypes, slice_info
 
     def set_up_artifacts(self):
-        self.subbuffer_layout, self.buffer_sizes, self.slice_info = (
+        self.subbuffer_layout, self.buffer_sizes, self.buffer_dtypes, self.slice_info = (
             self._calculate_buffer_layout()
         )
         operator_mlir_map, comp_runlist = self._operator_mlir_map_and_runlist()
@@ -554,6 +582,7 @@ class FusedMLIROperator(AIEOperatorBase):
             runlist=comp_runlist,
             subbuffer_layout=self.subbuffer_layout,
             buffer_sizes=self.buffer_sizes,
+            buffer_dtypes=self.buffer_dtypes,
             buffer_order=self.buffer_order,
             runtime_buffer_order=self.runtime_buffer_order,
             slice_info=self.slice_info,
@@ -569,6 +598,7 @@ class FusedMLIROperator(AIEOperatorBase):
                 runlist=comp_runlist,
                 subbuffer_layout=self.subbuffer_layout,
                 buffer_sizes=self.buffer_sizes,
+                buffer_dtypes=self.buffer_dtypes,
                 buffer_order=self.buffer_order,
                 runtime_buffer_order=self.runtime_buffer_order,
                 slice_info=self.slice_info,
@@ -723,11 +753,12 @@ class FusedFullELFCallable(FullELFCallable):
         super().__init__(elf_data)
 
         self.op = op
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
         self._buffers = {}
         for name in op.buffer_order:
+            dtype = np.dtype(op.buffer_dtypes[name])
+            itemsize = dtype.itemsize
             size = max(op.buffer_sizes[name], itemsize) // itemsize
-            buffer = XRTTensor((size,), dtype=ml_dtypes.bfloat16)
+            buffer = XRTTensor((size,), dtype=dtype)
             self._buffers[name] = buffer
             setattr(self, f"{name}_buffer", buffer)
 
@@ -763,14 +794,14 @@ class FusedFullELFCallable(FullELFCallable):
 
         buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
         main_buffer = self._buffers[buf_type]
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
+        dtype = np.dtype(self.op.buffer_dtypes[buf_type])
+        itemsize = dtype.itemsize
         sub_buffer = XRTSubBuffer(
             parent_bo=main_buffer.buffer_object(),
             offset_bytes=offset,
             size_bytes=length,
             shape=(length // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-            parent_tensor=main_buffer,
+            dtype=dtype,
         )
         self._buffer_cache[buffer_name] = sub_buffer
         return sub_buffer
@@ -781,6 +812,11 @@ class FusedFullELFCallable(FullELFCallable):
         self._buffers[name] = buffer
         setattr(self, f"{name}_buffer", buffer)
         self._buffer_cache.clear()
+
+    def mark_buffer_dirty(self, name):
+        if name not in self._buffers:
+            raise ValueError(f"unknown fused buffer type: {name}")
+        self._buffers[name].device = "cpu"
 
     def __call__(self):
         self.input_buffer.to("npu")
@@ -844,11 +880,12 @@ class FusedXclbinCallable:
         )
         self.handle = aie_utils.DefaultNPURuntime.load(npu_kernel)
 
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
         self._buffers = {}
         for name in op.buffer_order:
+            dtype = np.dtype(op.buffer_dtypes[name])
+            itemsize = dtype.itemsize
             size = max(op.buffer_sizes[name], itemsize) // itemsize
-            buffer = XRTTensor((size,), dtype=ml_dtypes.bfloat16)
+            buffer = XRTTensor((size,), dtype=dtype)
             self._buffers[name] = buffer
             setattr(self, f"{name}_buffer", buffer)
 
@@ -863,17 +900,22 @@ class FusedXclbinCallable:
 
         buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
         main_buffer = self._buffers[buf_type]
-        itemsize = np.dtype(ml_dtypes.bfloat16).itemsize
+        dtype = np.dtype(self.op.buffer_dtypes[buf_type])
+        itemsize = dtype.itemsize
         sub_buffer = XRTSubBuffer(
             parent_bo=main_buffer.buffer_object(),
             offset_bytes=offset,
             size_bytes=length,
             shape=(length // itemsize,),
-            dtype=ml_dtypes.bfloat16,
-            parent_tensor=main_buffer,
+            dtype=dtype,
         )
         self._buffer_cache[buffer_name] = sub_buffer
         return sub_buffer
+
+    def mark_buffer_dirty(self, name):
+        if name not in self._buffers:
+            raise ValueError(f"unknown fused buffer type: {name}")
+        self._buffers[name].device = "cpu"
 
     def __call__(self):
         self.input_buffer.to("npu")
