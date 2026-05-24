@@ -6,6 +6,7 @@ from ml_dtypes import bfloat16
 
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.controlflow import range_
 from aie.iron.device import Tile
 from aie.iron.placers import SequentialPlacer
 
@@ -133,7 +134,7 @@ def my_w4a16_gemm(
 
     def core_body(a_fifo, qp_fifo, c_fifo, accum_kernel):
         for _m_group in range(m_tile_groups):
-            for _n_group in range(n_tile_groups):
+            for _n_group in range_(n_tile_groups):
                 c = c_fifo.acquire(1)
                 for _k_tile in range(k_tiles):
                     a = a_fifo.acquire(1)
