@@ -94,8 +94,9 @@ The NPU runtime uses one batch transformer decode path for both single-request
 and multi-request inference. Transformer decode Linear ops use padded-row
 `W4A16GEMM` over the pre-dequantized `gemm_weight` tile stream. Decode chooses
 4/8/16/32 padded rows from the requested batch size, so decode uses the same
-batch code path while satisfying the `aie::mmul` tile shape. The `lm_head` uses
-a batch `W4A16GEMV` that shares one `uint8` qparam buffer across all active
-batch lanes, avoiding qparam replication while keeping the generated IR small.
+batch code path while satisfying the `aie::mmul` tile shape. Single-request
+`lm_head` still uses `W4A16GEMV`; multi-request `lm_head` uses `W4A16GEMM`
+over the tiled bf16 `gemm_weight` stream so vocab projection no longer scales
+linearly with batch size.
 Prefill transformer Linear ops also use `W4A16GEMM`, so the hot paths do not
 build temporary dense bf16 Linear weights on the host.

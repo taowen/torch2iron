@@ -31,7 +31,7 @@ import safetensors.torch
 import torch
 
 
-PACKED_FORMAT = "quantized_qwen3_w4a16_inference_v9"
+PACKED_FORMAT = "quantized_qwen3_w4a16_inference_v10"
 PACKED_DIRNAME = "qwen3_w4a16_packed"
 PACKED_MANIFEST = "manifest.json"
 PACKED_DATA = "weights.w4a16.bin"
@@ -507,33 +507,34 @@ def write_packed_inference_artifact(
                 ),
                 "zero_bias": 8,
             }
-            if prefix != "lm_head":
-                gemm_weight = make_gemm_bf16_tile(
-                    packed,
-                    scales_out_major,
-                    in_features=in_features,
-                    out_features=out_features,
-                    group_size=group_size,
-                )
-                gemm_weight_offset, gemm_weight_length = _write_bytes(
-                    f,
-                    _bf16_bytes(gemm_weight),
-                )
-                linear_entry["gemm_weight"] = _segment(
-                    name=f"{prefix}.gemm_tile_bf16_weight",
-                    role="linear_gemm_tile_bf16_weight",
-                    source=f"{prefix}.qweight",
-                    shape=tuple(int(dim) for dim in gemm_weight.shape),
-                    dtype="bfloat16",
-                    byte_offset=gemm_weight_offset,
-                    byte_length=gemm_weight_length,
-                    layout="col_major_n_group_k_tile_kblock_nblock_s_t_bf16_mmul",
-                )
-                linear_entry["gemm_tile"] = {
-                    "tile_k": 128,
-                    "tile_n": 64,
-                    "num_aie_columns": 8,
-                }
+            gemm_tile_n = 16 if prefix == "lm_head" else 64
+            gemm_weight = make_gemm_bf16_tile(
+                packed,
+                scales_out_major,
+                in_features=in_features,
+                out_features=out_features,
+                group_size=group_size,
+                tile_n=gemm_tile_n,
+            )
+            gemm_weight_offset, gemm_weight_length = _write_bytes(
+                f,
+                _bf16_bytes(gemm_weight),
+            )
+            linear_entry["gemm_weight"] = _segment(
+                name=f"{prefix}.gemm_tile_bf16_weight",
+                role="linear_gemm_tile_bf16_weight",
+                source=f"{prefix}.qweight",
+                shape=tuple(int(dim) for dim in gemm_weight.shape),
+                dtype="bfloat16",
+                byte_offset=gemm_weight_offset,
+                byte_length=gemm_weight_length,
+                layout="col_major_n_group_k_tile_kblock_nblock_s_t_bf16_mmul",
+            )
+            linear_entry["gemm_tile"] = {
+                "tile_k": 128,
+                "tile_n": gemm_tile_n,
+                "num_aie_columns": 8,
+            }
             manifest["linears"][prefix] = linear_entry
         if "lm_head" not in manifest["linears"]:
             lm_source = "lm_head.weight" if "lm_head.weight" in tensors else "model.embed_tokens.weight"
@@ -546,6 +547,18 @@ def write_packed_inference_artifact(
                 in_features = int(tensors[lm_source].shape[1])
                 qparam = make_qparam(packed, scales_out_major)
                 qparam_offset, qparam_length = _write_bytes(f, _uint8_bytes(qparam))
+                gemm_weight = make_gemm_bf16_tile(
+                    packed,
+                    scales_out_major,
+                    in_features=in_features,
+                    out_features=int(out_features),
+                    group_size=group_size,
+                    tile_n=16,
+                )
+                gemm_weight_offset, gemm_weight_length = _write_bytes(
+                    f,
+                    _bf16_bytes(gemm_weight),
+                )
                 lm_head_entry = {
                     "name": "lm_head",
                     "in_features": in_features,
@@ -562,6 +575,21 @@ def write_packed_inference_artifact(
                         byte_length=qparam_length,
                         layout="out_major_qweight_then_bf16_scales",
                     ),
+                    "gemm_weight": _segment(
+                        name="lm_head.gemm_tile_bf16_weight",
+                        role="linear_gemm_tile_bf16_weight",
+                        source=lm_source,
+                        shape=tuple(int(dim) for dim in gemm_weight.shape),
+                        dtype="bfloat16",
+                        byte_offset=gemm_weight_offset,
+                        byte_length=gemm_weight_length,
+                        layout="col_major_n_group_k_tile_kblock_nblock_s_t_bf16_mmul",
+                    ),
+                    "gemm_tile": {
+                        "tile_k": 128,
+                        "tile_n": 16,
+                        "num_aie_columns": 8,
+                    },
                     "zero_bias": 8,
                     "synthetic": True,
                 }

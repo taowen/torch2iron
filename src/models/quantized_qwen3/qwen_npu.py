@@ -228,11 +228,12 @@ class QwenNpuRunner:
             config.emb_dim,
         )
         lm_head = self.aie_ops.decode.lm_head_fused
+        lm_head_rows = self.aie_ops.decode.lm_head_rows
         lm_head.mark_buffer_dirty("input")
         lm_head.get_buffer("x").torch_view().view(
-            self.batch_size,
+            lm_head_rows,
             config.emb_dim,
-        )[:, :] = hidden_out[: self.batch_size, :]
+        )[:, :] = hidden_out[:lm_head_rows, :]
         lm_head_start = time.perf_counter() if profile_decode else 0.0
         lm_head()
         lm_head_stop = time.perf_counter() if profile_decode else 0.0
@@ -244,10 +245,9 @@ class QwenNpuRunner:
                 lm_head_stop - lm_head_start,
             )
         return lm_head.get_buffer("logits").torch_view().view(
-            self.batch_size,
-            1,
+            lm_head_rows,
             config.vocab_size,
-        )
+        )[: self.batch_size, :].view(self.batch_size, 1, config.vocab_size)
 
 
 def _make_batch_prompts(
