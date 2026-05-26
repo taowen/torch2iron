@@ -18,6 +18,9 @@ The default history length is one 16-token tile per plane:
 buffer_length = 0x1000 dwords
 ```
 
+`buffer_offset` is a byte offset into the runtime KV BO. `buffer_length`
+remains a dword count, matching MLIR-AIE's lowered NPU descriptor contract.
+
 The emitted shim BD IDs are compiler-legal local IDs `12..15`. Earlier
 FastFlowLM traces often patch high BD slots such as `15`; MLIR-AIE verifies BD
 IDs per shim DMA local namespace, so this experiment keeps the important part:

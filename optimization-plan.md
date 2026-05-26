@@ -84,6 +84,37 @@ FastFlowLM fused layer engine 的反编译依据保存在 `/var/home/taowen/proj
 - runlist 主要减少 host submit/syscall 开销；layer 之间仍有 hidden state 数据依赖，不能真正并行计算。
 - prefill 可先维持 chunk/big-M GEMM 路径；短期最值得复刻的是 decode layer fused online-Q4。
 
+## FusedMLIROperator 的边界
+
+`FusedMLIROperator` 仍然有明确用途，但它不是 FastFlowLM layer engine
+本身。当前实现把多个 child `aie.device` 放进同一个 fused ELF，然后在 main
+`runtime_sequence` 中按 runlist 执行：
+
+```text
+Configure(op0) -> Run(op0.sequence)
+Configure(op1) -> Run(op1.sequence)
+Configure(op2) -> Run(op2.sequence)
+```
+
+这能表达 operator 级别的时序复用：op A 跑完后 op B 可以复用同一片 AIE
+坐标，host dispatch 可以减少，多个 operator 也可以共享统一的 L3 buffer
+layout。因此它适合 validation boundary、粗粒度 stage 拼接，以及最终
+layer0..layerN 这种层级 runlist 提交。
+
+它不能自动表达 FastFlowLM 的核心形态：同一个 layer engine 内部的
+Q/K/V/O/up/gate/down phase 复用同一批 worker program，row1 memtile static
+BD ring 持续存在，hidden/normed hidden 在 memtile/local stream replay，KV
+plane reader 读一次后 fanout/split，phase 之间靠 lock/BD/stream 推进。当前
+`FusedMLIROperator` 的 operator 间连接主要是 child operator drain 到 L3
+scratch BO，再由下一个 operator fill 回 AIE；不是 op0 的 local/memtile
+stream 直接接 op1。
+
+所以后续不能继续靠修改 `FusedMLIROperator` 来模拟完整 layer engine。可以改进
+它来做更好的 coarse runlist、buffer packing、trace、调试和提交开销优化；但
+性能核心必须收敛到 layer-specific `MLIROperator` 或 low-level MLIR-AIE
+dataflow，在一个 device 内显式描述 phase scheduler、memtile BD ring、
+runtime `writebd` patch 和 worker/lock/stream 复用。
+
 ## 新的最高优先级
 
 ### 1. Q4NX packed layout 支持
@@ -115,6 +146,14 @@ FastFlowLM fused layer engine 的反编译依据保存在 `/var/home/taowen/proj
 ### 3. Fused layer engine
 
 QKV 原型通过后，把目标从 generic GEMM 转为 layer-specific engine：
+
+正式实现入口命名为 `Qwen3LayerFusedMLIROperator`。它不是通用
+`FusedMLIROperator` 的又一层包装，而是 Qwen3 单层 decode engine 的专用
+`MLIROperator`：对外保留 fused operator/callable 的使用形态，对内生成一个
+layer-specific `aie.device` 和 phase-level dataflow。第一版先落地
+q_current projection + current K/V plane write 这个 layer-local slice；后续把
+static KV reader、attention、O projection/residual 和 FFN phase 继续迁入同一个
+operator，而不是继续增加 child operator runlist。
 
 - layer 输入：hidden state、rope/position、packed layer weight、KV cache、norm weights。
 - layer 输出：下一层 hidden state、更新后的 KV cache。
@@ -222,6 +261,11 @@ decode 是当前性能差距最明显、也最能体现 packed Q4 online consump
     Q4NXFusedLinearProjection` 三段直接串进当前自动 fused runlist 会 timeout
     或让 `o_proj` 输出错误，因此下一步必须做单层专用 dataflow/placement，
     不能继续堆临时 operator。
+    当前 `Q4NXFusedLinearProjection` 和 `Q4NXFusedLinearResidualProjection`
+    已共享 `models.fast_qwen3.phase_tiles` 作为 projection fabric 的 single
+    source of truth：c2..c5/r2..r5 的 16 个 Q4NX projection workers、c2..c5
+    shim/memtile 以及 c0/c1/c6/c7 edge residual workers 不再在两个 design.py
+    里复制定义。这是后续 hand-placed layer phase schedule 的基础契约。
 11. 组装单层 fused layer engine。进行中：
     下一步不是继续扩展自动 `FusedMLIROperator` runlist，而是写手工 phase dataflow：
     projection fabric 已有可运行 512-wide block，下一步要把它从 isolated
@@ -260,6 +304,16 @@ decode 是当前性能差距最明显、也最能体现 packed Q4 online consump
     bit-exact 保持，写入 row 的差异只来自 projection 数值误差。下一步应把这个
     边界和 O projection/residual 边界收敛成单层 layer-local phase schedule，
     同时继续用 stream-switch decode 和数值探针收敛 attention edge fabric。
+    `QwenPlaneAttentionCurrent -> Q4NXFusedLinearResidualProjection` 已跑通，
+    验证四平面 attention output 可以直接喂 packed-Q4 O projection + residual
+    add；64-token/16-token tile、8-patch O block 的
+    `o_proj_residual_max_abs_error=0.0234375`，单次样本约 2.93 ms。尝试把
+    `Q4NXFusedQCurrentProjection -> QwenCurrentKVPlaneWrite ->
+    Q4NXFusedQCurrentProjection -> QwenPlaneAttentionCurrent ->
+    Q4NXFusedLinearResidualProjection` 作为一个自动 fused runlist 会 runtime
+    timeout，即使 O projection 缩到 1 patch 也 timeout。因此当前稳定边界已经
+    足够证明各 phase 可衔接；下一步必须写手工 layer-local phase schedule，
+    不能继续堆自动 runlist 段数。
 12. 用 Python for-loop 跑完整模型，确认端到端 token 输出正确。
 13. 引入 runlist，把每 token 的多层 submit 合并。
 14. 再优化 `lm_head` 和 prefill。
@@ -297,7 +351,19 @@ decode 是当前性能差距最明显、也最能体现 packed Q4 online consump
 - 输出：每个 KV group 一个 `q_current`，shape 是 `[num_kv_groups, 512]`，包含两个 Q heads、current K、current V。
 - 数值：单组单 op smoke 相对 CPU reference 的 `max_abs_error=0.005859375`；8-group 单 op smoke 的 `max_abs_error=0.01171875`。
 - 性能：单组 3 次样本 median 约 0.44 到 0.47 ms；8-group 单 op smoke 的 3 次样本 median 约 1.20 ms。旧 packet-cache direct 8-group `projection -> attention` smoke 的 `attention_max_abs_error=0.0078125`，3 次样本 median 约 2.04 ms。新四平面 direct 8-group `projection -> plane attention` smoke 在 64-token/16-token tile 下 `attention_max_abs_error=0.015380859375`，3 次样本 median 约 1.89 ms；128-token/32-token tile 下 `attention_max_abs_error=0.007198333740234375`，单次样本约 2.34 ms；7-token tail 下 `attention_max_abs_error=0.029296875`。
+- layer-local variant：`Qwen3LayerFusedMLIROperator` 第一版已把 q_current projection 和 current-row plane write 合进同一个 layer-specific device。standalone smoke 中 `q_current_max_abs_error=0.015625`，未写入 plane rows bit-exact 保持，写入 row `plane_written_max_abs_error=0.0078125`，单次样本约 1.95 ms。这说明 projection phase 内可以直接持久化 K/V row，不需要一个独立 writer RunOp 才能表达这个语义。
+- static KV reader contract：`operators/qwen3_layer_fused/static_kv_reader.py` 已把 row1 memtile static BD ring 和 runtime `writebd` 四平面 patch 从低层 experiment 迁入 `fast_qwen3` 主线。contract smoke 已覆盖 L=7、128、129，确认 `history_length_dwords = ceil(L/16) * 0x1000`，ring A/B 的 BD/lock 映射和 `k03/v03/k47/v47` 四平面 patch 都符合 FastFlowLM 参考。worker-facing mapping 也已固定：`g0..g3` 消费 `k03/v03` 并落在 `c0r2..c3r2`，`g4..g7` 消费 `k47/v47` 并落在 `c4r2..c7r2`；每个 worker 已接入真实 attention ABI（init/update/finalize，local q_current/plane tile/state/acc/out buffer）。q/kv/context FIFO route contract 也已结构化输出，但不能直接降成 high-level `aie.objectfifo`：实验版本在 `c0r1` 上触发 `number of output DMA channel exceeded`，说明 static KV scan 必须继续用显式 BD/lock/stream route，而不是把 `QwenPlaneAttentionCurrent` 的 ObjectFIFO fanout 搬过来。合并后的 contract MLIR 已通过 `aiecc` routing、Peano core compile、attention object link 和 xclbin 生成。下一步要把这些 local ABI buffer 替换成 static ring stream 接入，替代 `QwenPlaneAttentionCurrent` 里的 ordinary per-chunk `Runtime.fill`。
+- core-DMA slice：`qwen3_layer_static_kv_core_dma_contract_smoke.py` 已验证更低层的第一段真实链路：runtime `writebd(k03)`、row1 `ring_a` load/split、`ring_a` half0/half1 到 `worker_g0/g1` 的 core-tile S2MM DMA、worker-local empty/full lock 和 ping-pong buffer。这个最小 MLIR 已通过 `aiecc` resource allocation、routing、2-core Peano compile 和 xclbin 生成。它还没有接 attention kernel，但证明了“static memtile ring 输出进入 worker local buffer”这一步可以用显式 BD/lock 表达；后续要把这个模式扩到 attention worker 所需的 K/V pair 输入，而不是回到 high-level ObjectFIFO fanout。
+- K/V-pair core-DMA slice：`qwen3_layer_static_kv_pair_core_dma_contract_smoke.py` 已把上面的链路扩到真实 attention 输入形状的一半：`ring_a` 读取 `k03`、`ring_b` 读取 `v03`，两个 worker 各自用 core DMA0 接 K half、DMA1 接 V half，并用 worker-local K/V empty/full lock 做 ping-pong。这个 MLIR 也已通过 `aiecc` resource allocation、routing、2-core Peano compile 和 xclbin 生成，说明单 worker 双输入流的静态 reader 形态可行。下一步是把 worker no-op loop 换成 attention update ABI，并复制到 `k47/v47` plane pair。
+- K/V-pair attention ingress slice：`qwen3_layer_static_kv_pair_attention_ingress_contract_smoke.py` 已把 no-op consumer 换成真实 attention update ABI。`qwen_plane_group_attention_update_split_bf16` 新增为 split K/V 输入版本，worker 在 ping/pong K/V buffer 上直接调用这个 kernel。该 contract 已通过文本 smoke、AIE resource allocation、routing、2-core Peano compile、外部 attention object link 和 xclbin 生成；`scripts/build_fast_qwen3_plane_attention_kernel_object.sh` 固化了这个 text-level contract 所需的 kernel object 构建命令。
+- dual-pair attention ingress slice：`qwen3_layer_static_kv_dual_pair_attention_ingress_contract_smoke.py` 已把同样的 split-update ingress 复制到第二个 plane pair，但没有退回 per-group `Runtime.fill`。`mem0` 从 shim column 0 读 `k03/v03` 并喂 `worker_g0/g1`，`mem4` 从 shim column 4 读 `k47/v47` 并喂 `worker_g4/g5`；runtime 仍只有四个 `writebd` descriptor。该 MLIR 已通过 `aiecc` resource allocation、routing、4-core Peano compile、attention object link 和 xclbin 生成。`scripts/run_fast_qwen3_layer_static_kv_dual_pair_attention_ingress_xrt_smoke.sh` 进一步生成 NPU insts 并实际执行，返回 `ERT_CMD_STATE_COMPLETED`，本轮样本约 0.98 ms。下一步是补齐 `g2/g3/g6/g7` 的分发、q_current ingress 和 context egress，把这个合同真正并入 `Qwen3LayerFusedMLIROperator`。
+- quad-pair attention ingress slice：`qwen3_layer_static_kv_quad_pair_attention_ingress_contract_smoke.py` 已把 split-update ingress 扩到 8 个 attention workers。`mem0/mem2` 分别从 shim column 0/2 读取 `k03/v03` 并喂 `g0/g1`、`g2/g3`；`mem4/mem6` 分别从 shim column 4/6 读取 `k47/v47` 并喂 `g4/g5`、`g6/g7`。该 slice 仍重复读每个 plane pair 一次，不是最终带宽最优 fanout；但它已通过 L=128/L=129 文本 smoke、AIE resource allocation、routing、8-core Peano compile、attention object link、NPU insts 生成和 xclbin 生成。`scripts/run_fast_qwen3_layer_static_kv_quad_pair_attention_ingress_xrt_smoke.sh` 实际执行返回 `ERT_CMD_STATE_COMPLETED`，本轮样本约 1.40 ms。下一步应消掉重复 plane-pair read，并补 q_current ingress/context egress。
+- one-pair two-stage fanout slice：`qwen3_layer_static_kv_one_pair_two_stage_attention_ingress_contract_smoke.py` 已验证去掉同一 plane-pair 重复 DDR 读的可行形态。它只覆盖 `k03/v03 -> g0..g3`：source `mem1` 从 shim column 1 只读一次 K/V full tile，然后把 full-tile streams 转发到 `mem0/mem2`；`mem0` split 给 `g0/g1`，`mem2` split 给 `g2/g3`。这样不让一个 memtile 同时承担“本地 split + 再 fanout”，避免超过 4 条 output DMA。该 slice 已通过文本 smoke、AIE resource allocation、routing、4-core Peano compile、attention object link、NPU insts/xclbin 生成，并用 `scripts/run_fast_qwen3_layer_static_kv_one_pair_two_stage_attention_ingress_xrt_smoke.sh` 实际执行返回 `ERT_CMD_STATE_COMPLETED`，本轮样本约 1.01 ms。下一步是把这个 one-read 拓扑变成 bounded/finalize/context 数值闭环，然后复制到 `k47/v47`。
+- one-pair two-stage bounded slice：`qwen3_layer_static_kv_one_pair_two_stage_attention_bounded_contract_smoke.py` 已把上面的 one-read 拓扑变成有限 attention loop + `finalize_bf16` + context egress 的数值闭环。它仍只覆盖 `k03/v03 -> g0..g3`，用 2 个 coarse runtime MM2S tasks 喂 source `mem1`，避免再次引入 per-group KV fill；`q_current` 在 worker 本地确定性清零，不占第三条 input DMA。`scripts/run_fast_qwen3_layer_static_kv_one_pair_two_stage_attention_bounded_xrt_smoke.sh` 已通过 AIE 编译、4-core link、xclbin/insts 生成、XRT 执行和 CPU contract reference 对拍，当前样本 `max_abs_error=0.0087890625`、`mean_abs_error=0.0040073394775390625`、`npu_time_ns=1374923`。这说明 one-read two-stage routing 不只是能编译，也能跑出可验证 context；下一步复制到 `k47/v47` 并合成完整 8-group one-read bounded slice。
+- full two-stage bounded slice：`qwen3_layer_static_kv_full_two_stage_attention_bounded_contract_smoke.py` 已把 one-read/two-stage 拓扑扩到完整 8 workers。`mem1` 只读一次 `k03/v03` 并 fanout 到 `mem0/mem2`，`mem5` 只读一次 `k47/v47` 并 fanout 到 `mem4/mem6`；四个 second-stage memtile 再 split 到 `g0..g7`。runtime sequence 已从 high-level DMA task 改成显式 patched descriptor start：4 个 KV `aiex.npu.writebd + address_patch + push_queue`，8 个 context `writebd + address_patch + push_queue`，最后对 8 个 S2MM context queue 执行 `aiex.npu.sync`。这确认了 `writebd` 本身只 patch descriptor，真正启动必须 `push_queue`，host-visible completion 需要 S2MM `sync`。`scripts/run_fast_qwen3_layer_static_kv_full_two_stage_attention_bounded_xrt_smoke.sh` 已通过 AIE 编译、8-core link、xclbin/insts 生成、XRT 执行和 CPU contract reference 对拍，当前样本 `max_abs_error=0.0087890625`、`mean_abs_error=0.0040073394775390625`、`npu_time_ns=2011319`。这个 slice 已经消掉 duplicate-read quad baseline 的重复 plane-pair DDR 读并固化了低层 descriptor 启动语义；后续优化重点是降低 source/fanout fabric 成本，并把 host-visible context egress 改成 O-projection 输入。
+- bounded quad attention slice：`qwen3_layer_static_kv_quad_pair_attention_bounded_contract_smoke.py` 在不修改上面 duplicate-read quad baseline 的前提下，新增有限 KV tile loop、`llama_chunked_attention_finalize_bf16` 和 host-visible context egress。这个数值闭环 slice 仍保留 duplicate-read 拓扑，但为了让 host 能等待 context 输出，KV 输入先用 8 个 coarse runtime MM2S tasks 喂现有 row1 rings，而不是 `npu.writebd` patch；`q_current` 在 worker 本地确定性清零，避免占第三条 worker input DMA。`scripts/run_fast_qwen3_layer_static_kv_quad_pair_attention_bounded_xrt_smoke.sh` 已通过 AIE 编译、8-core link、xclbin/insts 生成、XRT 执行和 CPU contract reference 对拍，当前样本 `max_abs_error=0.0087890625`、`mean_abs_error=0.0040073394775390625`、`npu_time_ns=1830882`。这个 slice 证明 attention update/finalize/context drain 能闭环；后续再把 runtime input task 换回真正的 static descriptor 启动语义，并消掉 duplicate plane-pair read。
 - 已确认的限制：`projection -> attention` 可以重复执行；`projection -> writer` 也可以重复执行；但 `projection -> writer -> attention` 或 `projection -> attention -> writer` 的三段临时 runlist 第二次调用会 timeout。当前不把这个三段边界作为正式方向，后续 layer engine 应直接在 layer-local dataflow 中持久化 current K/V。
+- 新增限制：`Qwen3LayerFusedMLIROperator -> Q4NXFusedQCurrentProjection -> QwenPlaneAttentionCurrent` 这个更短的自动 runlist 仍会 runtime timeout，尽管 merged projection/write operator 单独运行正确。因此后续不能靠“把局部 operator 合大一点然后继续自动串接”解决完整 layer；需要继续扩展 `Qwen3LayerFusedMLIROperator` 自身的 layer-local phase schedule。
 
 `q4nx_fused_linear_projection` 当前是 attention 后 `o_proj` 的 online-Q4 projection block 原型：
 
@@ -316,6 +382,10 @@ decode 是当前性能差距最明显、也最能体现 packed Q4 online consump
   smoke 已跑通，output-row/full-K 版本 `o_proj_max_abs_error=0.0244140625`，
   8-patch grouped-DMA 版本 3 次样本 median 约 1.45 ms。它验证 attention context 可以作为后续 online-Q4 projection 的
   输入继续消费。
+- placement contract：普通 `o_proj` 和 `o_proj -> residual` 已改为共享
+  `phase_tiles.py`；回归 smoke 中普通 `o_proj` 的 `max_abs_error=0.0234375`，
+  `o_proj+residual` 的 `max_abs_error=0.03125`，`plane attention -> o_proj+residual`
+  的 `o_proj_residual_max_abs_error=0.0234375`。
 - 失败实验：把 `Q4NXFusedQCurrentProjection -> QwenChunkedAttentionCurrent ->
   Q4NXFusedLinearProjection` 直接作为三段自动 fused runlist，会出现 runtime
   timeout；使用 4 个独立 `o_proj` block 时可跑完但 isolated `o_proj` error
@@ -366,6 +436,7 @@ decode 是当前性能差距最明显、也最能体现 packed Q4 online consump
 - 性能：64-token/16-token tile 的 3 次样本 median 约 0.79 ms；128-token/32-token tile 的单次样本约 0.92 ms，短 run 抖动明显。
 - 当前高层实现为每个 plane pair、每个 chunk 发一个 ordinary runtime fill；64-token/16-token tile 和 128-token/32-token tile 都是 8 个 KV fill tasks，不再按 8 个 KV group 重复读。
 - 集成验证：`Q4NXFusedQCurrentProjection -> QwenPlaneAttentionCurrent` 已跑通，覆盖 packed-Q4 q_current projection 到四平面 attention 的直接替换边界。64-token/16-token tile 的 `attention_max_abs_error=0.015380859375`，3 次样本 median 约 1.89 ms；128-token/32-token tile 的 `attention_max_abs_error=0.007198333740234375`。
+- 集成验证：`QwenPlaneAttentionCurrent -> Q4NXFusedLinearResidualProjection` 已跑通，覆盖四平面 attention output 到 O projection residual 的后续 phase 边界；64-token/16-token tile、8-patch O block 的 `o_proj_residual_max_abs_error=0.0234375`，单次样本约 2.93 ms。
 - 已确认的限制：128-token/16-token tile 仍会生成 16 个 KV fill tasks，加上 Q/drain 后触发 BD 预算；最终长 context reader 仍应把 per-chunk runtime tasks 收敛成 row1 memtile static BD chain + lock ring。
 
 `qwen_qkv_to_q_current` 当前是 QKV projection 与 attention 之间的 fused-layout bridge：

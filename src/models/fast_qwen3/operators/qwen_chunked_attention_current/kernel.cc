@@ -108,6 +108,21 @@ static inline void normalize_acc_to_bf16(const float *__restrict acc,
 
 extern "C" {
 
+void qwen_zero_q_current_bf16(bfloat16 *__restrict q_current,
+                              int32_t elements)
+{
+    event0();
+    constexpr int vec_len = LLAMA_VEC_SIZE;
+    aie::vector<bfloat16, vec_len> zero_vec =
+        aie::zeros<bfloat16, vec_len>();
+
+    for (int32_t offset = 0; offset < elements; offset += vec_len) {
+        aie::store_v(q_current + offset, zero_vec);
+    }
+
+    event1();
+}
+
 void llama_chunked_attention_init_f32(float *__restrict state,
                                       float *__restrict acc,
                                       int32_t q_heads,
@@ -538,6 +553,109 @@ void qwen_plane_group_attention_update_bf16(
             const bfloat16 *__restrict v_row =
                 row_is_current ? current_value
                                : v_plane_chunk + row * head_dim_const;
+            accumulate_value_inplace(q_acc, v_row, weight, head_dim_const);
+        }
+
+        q_state[0] = new_max;
+        q_state[1] = old_sum * correction + chunk_sum;
+    }
+
+    event1();
+}
+
+void qwen_plane_group_attention_update_split_bf16(
+    const bfloat16 *__restrict q_current,
+    const bfloat16 *__restrict k_plane_group_chunk,
+    const bfloat16 *__restrict v_plane_group_chunk,
+    float *__restrict state,
+    float *__restrict acc,
+    int32_t current_row,
+    int32_t valid_rows,
+    int32_t q_heads,
+    int32_t chunk_size,
+    int32_t head_dim)
+{
+    event0();
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    constexpr int vec_len = LLAMA_VEC_SIZE;
+    constexpr int q_heads_const = LLAMA_Q_HEADS_PER_GROUP;
+    constexpr int chunk_size_const = LLAMA_CHUNK_SIZE;
+    constexpr int head_dim_const = LLAMA_HEAD_DIM;
+    (void)q_heads;
+    (void)chunk_size;
+    (void)head_dim;
+
+    const bfloat16 *__restrict current_key =
+        q_current + LLAMA_Q_HEADS_PER_GROUP * head_dim_const;
+    const bfloat16 *__restrict current_value = current_key + head_dim_const;
+
+    for (int32_t q_head = 0; q_head < q_heads_const; q_head++) {
+        const bfloat16 *__restrict q = q_current + q_head * head_dim_const;
+        float *__restrict q_state = state + q_head * 2;
+        float *__restrict q_acc = acc + q_head * head_dim_const;
+        float scores[LLAMA_CHUNK_SIZE];
+        float chunk_max = -__builtin_inff();
+        bool has_valid = false;
+        aie::vector<bfloat16, vec_len> q_vecs[LLAMA_HEAD_BLOCKS];
+
+        for (int32_t block = 0; block < LLAMA_HEAD_BLOCKS; block++)
+            chess_flatten_loop
+        {
+            q_vecs[block] = aie::load_v<vec_len>(q + block * vec_len);
+        }
+
+        for (int32_t row = 0; row < chunk_size_const; row++) {
+            if (row >= valid_rows) {
+                scores[row] = -__builtin_inff();
+                continue;
+            }
+            bool row_is_current = row == current_row;
+            aie::accum<accfloat, vec_len> dot = aie::zeros<accfloat, vec_len>();
+            const bfloat16 *__restrict k_row =
+                row_is_current ? current_key
+                               : k_plane_group_chunk + row * head_dim_const;
+            for (int32_t block = 0; block < LLAMA_HEAD_BLOCKS; block++)
+                chess_flatten_loop
+            {
+                aie::vector<bfloat16, vec_len> k_vec =
+                    aie::load_v<vec_len>(k_row + block * vec_len);
+                dot = aie::mac(dot, q_vecs[block], k_vec);
+            }
+
+            float score =
+                aie::reduce_add(dot.template to_vector<float>()) * LLAMA_ATTN_SCALE;
+            scores[row] = score;
+            if (!has_valid || score > chunk_max) {
+                chunk_max = score;
+                has_valid = true;
+            }
+        }
+
+        if (!has_valid) {
+            continue;
+        }
+
+        float old_max = q_state[0];
+        float old_sum = q_state[1];
+        float new_max = old_max > chunk_max ? old_max : chunk_max;
+        float correction = old_sum > 0.0f ? exp_approx(old_max - new_max) : 0.0f;
+        float chunk_sum = 0.0f;
+
+        scale_acc_inplace(q_acc, correction, head_dim_const);
+
+        for (int32_t row = 0; row < chunk_size_const; row++) {
+            if (row >= valid_rows) {
+                continue;
+            }
+            bool row_is_current = row == current_row;
+            float score = scores[row];
+            float weight = exp_approx(score - new_max);
+            chunk_sum += weight;
+
+            const bfloat16 *__restrict v_row =
+                row_is_current ? current_value
+                               : v_plane_group_chunk + row * head_dim_const;
             accumulate_value_inplace(q_acc, v_row, weight, head_dim_const);
         }
 

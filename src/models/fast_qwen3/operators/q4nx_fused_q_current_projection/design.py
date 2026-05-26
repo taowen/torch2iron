@@ -13,6 +13,35 @@ from aie.iron.placers import SequentialPlacer
 PATCH_ROWS = 64
 
 
+def _tap(buffer_elements, offset, length):
+    return TensorAccessPattern(
+        (buffer_elements,),
+        offset,
+        [1, 1, 1, length],
+        [0, 0, 0, 1],
+    )
+
+
+def _kv_plane_offsets(group_idx, slot, packet_seq_len, head_dim):
+    plane_group_count = 4
+    token_stride_elements = plane_group_count * head_dim
+    plane_elements = packet_seq_len * token_stride_elements
+    token_base = slot * token_stride_elements
+    if group_idx < plane_group_count:
+        key_plane = 0
+        value_plane = 1
+        group_in_plane = group_idx
+    else:
+        key_plane = 2
+        value_plane = 3
+        group_in_plane = group_idx - plane_group_count
+    row_offset = token_base + group_in_plane * head_dim
+    return (
+        key_plane * plane_elements + row_offset,
+        value_plane * plane_elements + row_offset,
+    )
+
+
 def q4nx_fused_q_current_projection(
     dev,
     in_features,
@@ -25,6 +54,9 @@ def q4nx_fused_q_current_projection(
     func_prefix="",
     kernel_object="q4nx_fused_q_current_projection.o",
     verbose=False,
+    write_kv_plane=False,
+    packet_seq_len=0,
+    current_slot=0,
 ):
     if in_features % 256 != 0:
         raise ValueError("in_features must be divisible by 256")
@@ -32,6 +64,13 @@ def q4nx_fused_q_current_projection(
         raise ValueError("num_kv_groups must be positive")
     if head_dim % PATCH_ROWS != 0:
         raise ValueError("head_dim must be divisible by 64")
+    if write_kv_plane:
+        if packet_seq_len <= 0:
+            raise ValueError("packet_seq_len must be positive when writing KV plane")
+        if current_slot < 0 or current_slot >= packet_seq_len:
+            raise ValueError("current_slot must be inside packet_seq_len")
+        if group_index + num_kv_groups > 8:
+            raise ValueError("KV plane writer supports global groups in [0, 8)")
 
     chunk_bytes = 5120
     patch_bytes_per_k_chunk = 2 * chunk_bytes
@@ -55,6 +94,9 @@ def q4nx_fused_q_current_projection(
     q_elements_per_group = q_heads_per_group * head_dim
     q_current_elements_per_group = q_elements_per_group + 2 * head_dim
     q_current_elements = num_kv_groups * q_current_elements_per_group
+    token_stride_elements = 4 * head_dim
+    plane_elements = packet_seq_len * token_stride_elements if write_kv_plane else 0
+    kv_plane_elements = 4 * plane_elements
 
     hidden_ty = np.ndarray[(in_features,), np.dtype[bfloat16]]
     norm_weight_ty = np.ndarray[(in_features,), np.dtype[bfloat16]]
@@ -63,6 +105,8 @@ def q4nx_fused_q_current_projection(
     weight_chunk_ty = np.ndarray[(patch_bytes_per_k_chunk,), np.dtype[np.uint8]]
     patch_out_ty = np.ndarray[(PATCH_ROWS,), np.dtype[bfloat16]]
     q_current_ty = np.ndarray[(q_current_elements,), np.dtype[bfloat16]]
+    kv_plane_ty = np.ndarray[(max(1, kv_plane_elements),), np.dtype[bfloat16]]
+    kv_row_ty = np.ndarray[(head_dim,), np.dtype[bfloat16]]
 
     hidden_fifo = ObjectFifo(hidden_ty, name="q4nx_qcur_hidden", depth=1)
     norm_weight_fifo = ObjectFifo(
@@ -89,6 +133,11 @@ def q4nx_fused_q_current_projection(
         ObjectFifo(patch_out_ty, name=f"q4nx_qcur_out_{patch_idx}", depth=1)
         for patch_idx in range(q_current_patches)
     ]
+    kv_fifo = ObjectFifo(kv_row_ty, name="q4nx_qcur_kv_plane_row", depth=1)
+    kv_out = kv_fifo.cons().forward(
+        name="q4nx_qcur_kv_plane_row_out",
+        depth=1,
+    )
 
     norm_kernel = Kernel(
         f"{func_prefix}q4nx_rms_norm_full",
@@ -192,6 +241,8 @@ def q4nx_fused_q_current_projection(
     ]
 
     sequence_types = [hidden_ty, norm_weight_ty, weight_stream_ty, q_current_ty]
+    if write_kv_plane:
+        sequence_types.append(kv_plane_ty)
     if trace_size > 0:
         trace_ty = np.ndarray[(trace_size,), np.dtype[np.uint8]]
         sequence_types.extend([trace_ty] * max(1, trace_ddr_id - len(sequence_types) + 1))
@@ -199,6 +250,7 @@ def q4nx_fused_q_current_projection(
     rt = Runtime()
     with rt.sequence(*sequence_types) as runtime_args:
         hidden, norm_weight, weight_stream, q_current = runtime_args[:4]
+        kv_plane = runtime_args[4] if write_kv_plane else None
         if trace_size > 0:
             rt.enable_trace(trace_size, workers=[projection_workers[0]], ddr_id=trace_ddr_id)
         rt.start(*workers)
@@ -224,5 +276,44 @@ def q4nx_fused_q_current_projection(
                     task_group=tg,
                 )
             rt.finish_task_group(tg)
+            if write_kv_plane:
+                global_group = group_index + group_pos
+                key_dst_offset, value_dst_offset = _kv_plane_offsets(
+                    global_group,
+                    current_slot,
+                    packet_seq_len,
+                    head_dim,
+                )
+                q_current_group_offset = group_pos * q_current_elements_per_group
+                key_src_offset = q_current_group_offset + q_elements_per_group
+                value_src_offset = key_src_offset + head_dim
+                copy_tg = rt.task_group()
+                rt.fill(
+                    kv_fifo.prod(),
+                    q_current,
+                    _tap(q_current_elements, key_src_offset, head_dim),
+                    task_group=copy_tg,
+                )
+                rt.drain(
+                    kv_out.cons(),
+                    kv_plane,
+                    _tap(kv_plane_elements, key_dst_offset, head_dim),
+                    wait=True,
+                    task_group=copy_tg,
+                )
+                rt.fill(
+                    kv_fifo.prod(),
+                    q_current,
+                    _tap(q_current_elements, value_src_offset, head_dim),
+                    task_group=copy_tg,
+                )
+                rt.drain(
+                    kv_out.cons(),
+                    kv_plane,
+                    _tap(kv_plane_elements, value_dst_offset, head_dim),
+                    wait=True,
+                    task_group=copy_tg,
+                )
+                rt.finish_task_group(copy_tg)
 
     return Program(dev, rt).resolve_program(SequentialPlacer())

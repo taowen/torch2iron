@@ -20,6 +20,15 @@ boundaries that validate packed Q4NX online-MVM, hidden fanout, current-aware
 attention, and attention-output projection.  These operators are validation
 boundaries; the final layer engine should use the phase schedule documented from
 FastFlowLM rather than preserving every temporary operator boundary.
+The final implementation entry is `Qwen3LayerFusedMLIROperator`: a
+Qwen3-specific fused layer operator that generates one layer-local `aie.device`
+instead of stitching child operator `runtime_sequence`s together.  The first
+checked-in slice of that operator covers q_current projection plus current K/V
+plane persistence; subsequent work should extend this layer-local design with
+the static KV reader and attention/O/FFN phases.
+The shared placement contract for the current projection fabric lives in
+`phase_tiles.py`; validation operators use this single source of truth for the
+c2..c5/r2..r5 Q4NX projection workers and the edge residual workers.
 
 ## Artifact Layout
 
@@ -76,6 +85,129 @@ while eight output-patch workers walk each KV group.  For each Qwen3-0.6B group
 this is eight 64-row patches: four Q patches, two K patches, and two V patches,
 which fits the current eight-column worker layout without computing K/V patches
 for groups the following attention worker will not consume.
+`Qwen3LayerFusedMLIROperator` is the first layer-local variant of this phase:
+after producing `q_current`, the same layer-specific device copies current K/V
+rows into the persistent four-plane cache.  This removes one standalone writer
+`RunOp` from the projection/write boundary while preserving the external
+`kv_plane` BO in-place.  It intentionally starts as a narrow slice; it should be
+extended into the complete layer engine instead of adding another automatic
+multi-operator runlist boundary.
+
+The next layer-local boundary is the static KV reader contract in
+`operators/qwen3_layer_fused/static_kv_reader.py`.  It brings the FastFlowLM
+row1 memtile ring and runtime shim BD patching into the `fast_qwen3` path:
+ring A uses `0/1,2/3,24/25`, ring B uses `26/27,4/5,28/29`, and runtime patches
+the four physical planes `k03,v03,k47,v47` with `ceil(L/16) * 0x1000` dwords.
+The contract also fixes the worker-facing stream mapping: groups `g0..g3`
+consume `k03/v03` on workers `c0r2..c3r2`, and groups `g4..g7` consume
+`k47/v47` on workers `c4r2..c7r2`.  Each worker now declares the real
+`llama_chunked_attention_init_f32 -> qwen_plane_group_attention_update_bf16 ->
+llama_chunked_attention_finalize_bf16` ABI over local q_current, plane tile,
+state, accumulator, and output buffers.  The generated contract MLIR parses,
+routes, links the current attention object, and compiles with `aiecc`.  The
+q/kv/context FIFO route contract is also emitted and checked, but deliberately
+kept as BD/lock route metadata instead of high-level `aie.objectfifo`: a direct
+ObjectFIFO version over `c0r1` fails resource allocation with "number of output
+DMA channel exceeded".  The next implementation step is replacing the local ABI
+buffers with explicit static ring stream reads rather than ordinary per-chunk
+`Runtime.fill`.
+
+`qwen3_layer_static_kv_core_dma_contract_smoke.py` is the first executable slice
+of that lower-level route.  It narrows the scope to one physical plane
+(`k03`) and one memtile ring (`ring_a`), then connects `ring_a` half0/half1 to
+`worker_g0/worker_g1` local ping-pong buffers through core-tile S2MM DMA and
+worker-local locks.  This contract compiles with `aiecc`, so the next step is
+expanding the same explicit BD/lock pattern from two half consumers to the
+attention worker layout instead of reintroducing high-level KV ObjectFIFO
+fanout.
+
+`qwen3_layer_static_kv_pair_core_dma_contract_smoke.py` is the next slice: it
+uses `ring_a` for `k03` and `ring_b` for `v03`, then sends each worker both K
+and V through the two core S2MM input channels.  This also compiles with
+`aiecc`, which confirms the layer-local static reader can feed a worker with
+the two streams the current attention ABI needs.  The remaining work is to
+replace the consumer no-op loop with the attention update kernel and then scale
+the same route to the second plane pair.
+
+`qwen3_layer_static_kv_pair_attention_ingress_contract_smoke.py` replaces that
+consumer no-op with the real split-K/V attention update ABI.  The static reader
+still narrows scope to `k03/v03` and two workers, but each worker now calls
+`qwen_plane_group_attention_update_split_bf16` on ping and pong K/V buffers.  It
+compiles with `aiecc` after rebuilding the plane attention kernel object via
+`scripts/build_fast_qwen3_plane_attention_kernel_object.sh`.
+
+`qwen3_layer_static_kv_dual_pair_attention_ingress_contract_smoke.py` scales
+that ingress one step further without returning to per-group `Runtime.fill`:
+`mem0` reads `k03/v03` from shim column 0 and feeds `worker_g0/g1`, while
+`mem4` reads `k47/v47` from shim column 4 and feeds `worker_g4/g5`.  The
+generated MLIR still uses only four runtime `writebd` descriptors for the four
+physical planes, and compiles through routing, four Peano worker cores, external
+attention object link, and xclbin generation.  This validates the dual
+plane-pair static ingress shape.  The XRT smoke also executes this xclbin on
+NPU and returns `ERT_CMD_STATE_COMPLETED` with a sub-millisecond sample, so this
+slice is not compile-only.  The remaining attention work is filling in the other
+four group workers and adding q_current ingress/context egress.
+
+`qwen3_layer_static_kv_quad_pair_attention_ingress_contract_smoke.py` fills in
+all eight attention workers with the same static-reader shape: `mem0/mem2` both
+read `k03/v03` and feed `g0/g1` plus `g2/g3`, while `mem4/mem6` both read
+`k47/v47` and feed `g4/g5` plus `g6/g7`.  This is intentionally still a
+validation slice: it duplicates each plane-pair read once, so it is not the
+final bandwidth-optimal FastFlowLM fanout.  It does prove the full 8-worker
+split-K/V attention ingress can route, compile, generate NPU insts, and execute
+on NPU with `ERT_CMD_STATE_COMPLETED`.  The next step is removing the duplicate
+plane-pair read by decoding a real static split/fanout route, then wiring
+q_current ingress and context egress.
+
+`qwen3_layer_static_kv_one_pair_two_stage_attention_ingress_contract_smoke.py`
+is the first non-duplicating fanout slice.  It covers only one plane pair
+(`k03/v03 -> g0..g3`) but reads each plane from DDR once: source `mem1` receives
+the full K/V tiles from shim column 1, forwards full-tile streams to `mem0` and
+`mem2`, then those two second-stage memtiles split K/V halves to `g0/g1` and
+`g2/g3`.  This avoids asking one memtile to both feed local workers and fan out
+to another pair, which would exceed the four output-DMA channel budget.  The
+contract routes, compiles, generates xclbin/insts, and executes on NPU with
+`ERT_CMD_STATE_COMPLETED`.  The next step is to turn this one-pair ingress into
+a bounded/finalize/context slice, then instantiate the same pattern for
+`k47/v47`.
+
+`qwen3_layer_static_kv_one_pair_two_stage_attention_bounded_contract_smoke.py`
+adds the numeric closure for that one-read slice.  It keeps the same
+`k03/v03 -> g0..g3` two-stage fanout, changes the worker loop to a bounded
+history scan, finalizes BF16 context, and drains four context groups to the
+host.  Like the bounded quad baseline, it uses two coarse runtime MM2S KV
+input tasks so the host has a real completion boundary for context output;
+`q_current` is locally zeroed on each worker and does not consume a third input
+DMA.  The XRT smoke compiles and executes this slice on NPU and compares
+against the exact contract CPU reference (`max_abs_error=0.0087890625` in the
+current run).
+
+`qwen3_layer_static_kv_full_two_stage_attention_bounded_contract_smoke.py`
+extends that same one-read structure to all eight workers.  `mem1` reads
+`k03/v03` once and fans out to `mem0/mem2`, while `mem5` reads `k47/v47` once
+and fans out to `mem4/mem6`; those four second-stage memtiles split K/V halves
+to `g0..g7`.  This removes the duplicate plane-pair DDR read from the quad
+baseline while preserving the bounded finite-loop/finalize/context-drain smoke
+surface.  Its runtime sequence now spells out the patched descriptor start path
+directly: `aiex.npu.writebd`, `aiex.npu.address_patch`, `aiex.npu.push_queue`,
+and S2MM `aiex.npu.sync` for host-visible context completion.  The XRT smoke
+executes and matches the CPU contract reference (`max_abs_error=0.0087890625`,
+current sample about 2.01 ms).  It is a correctness/routing milestone, not yet
+the final fastest shape: the two-stage fanout has more static fabric than the
+duplicate-read baseline, so the next optimization is reducing that fabric cost
+and moving context from host egress into the O-projection phase.
+
+`qwen3_layer_static_kv_quad_pair_attention_bounded_contract_smoke.py` keeps
+that duplicate-read quad shape as a stable routing baseline, but changes the
+worker program from an infinite ingress loop into a finite history scan followed
+by `llama_chunked_attention_finalize_bf16` and context drain.  For the numeric
+smoke it feeds the row1 rings with eight coarse runtime MM2S tasks instead of
+`npu.writebd`, because `writebd` only patches descriptors and is not a useful
+completion boundary for host-visible context output.  `q_current` is
+deterministically zeroed on tile, avoiding a third worker input DMA.  The XRT
+smoke compiles the 8-worker bounded slice, executes it on NPU, drains all eight
+context groups, and compares against a CPU reference for the exact duplicate
+read contract (`max_abs_error=0.0087890625` in the current run).
 
 `QwenChunkedAttentionCurrent` is the first layer-local decode attention boundary.
 It receives Q plus the current K/V as one per-group stream, scans the packet
@@ -136,6 +268,20 @@ next token's q_current, and plane attention reads the just-written history row.
 This shows the cache update path can stay in high-level IRON for now; the
 remaining layer-engine work is placement/phase scheduling, not proving that
 current-row persistence requires low-level CDO.
+The first `Qwen3LayerFusedMLIROperator` slice works as an isolated phase, but
+replacing the first projection+writer pair in this multi-step automatic runlist
+with any merged projection/write device currently times out.  That reinforces
+the same boundary: use validation operators to prove local phase semantics, then
+extend the layer-local schedule instead of adding more automatic runs.
+
+`QwenPlaneAttentionCurrent -> Q4NXFusedLinearResidualProjection` is the matching
+post-attention phase boundary.  It validates that four-plane attention output can
+feed the packed-Q4 O projection plus residual add in the same fused ELF.  The
+automatic runlist boundary does not scale indefinitely: extending one fused call
+through two q_current projections, persistent plane write, plane attention, and
+O residual times out even with a one-patch O projection.  That is the current
+line where the work should switch from stacking validation operators to a
+single hand-placed layer phase schedule.
 
 `QwenQKVToQCurrent` bridges the QKV projection patch layout to the grouped
 attention layout.  With the current 8-patch QKV projection it assembles the
@@ -161,6 +307,9 @@ stable integration boundary today is
 Q4NXFusedLinearProjection` in the current automatic fused runlist times out or
 produces incorrect O output, so the full layer path needs a manually designed
 layer-local dataflow rather than more temporary operator chaining.
+`Q4NXFusedLinearProjection` and `Q4NXFusedLinearResidualProjection` now share the
+same `phase_tiles.py` placement contract, so future layer-local schedules do not
+duplicate the projection fabric mapping in each design.
 
 `Q4NXFusedLinearResidualProjection` is the first residual-path phase boundary.
 It keeps the same 512-wide `o_proj` fabric and adds a second stage on edge
@@ -201,8 +350,19 @@ scripts/run_fast_qwen3_plane_attention_smoke.sh --warmup-iters 1 --timed-iters 5
 scripts/run_fast_qwen3_plane_attention_smoke.sh --attend-seq-len 128 --current-slot 127 --tile-size 32 --warmup-iters 1 --timed-iters 1
 scripts/run_fast_qwen3_q_current_plane_attention_smoke.sh --warmup-iters 1 --timed-iters 5
 scripts/run_fast_qwen3_q_current_plane_attention_smoke.sh --attend-seq-len 128 --current-slot 127 --tile-size 32 --warmup-iters 1 --timed-iters 1
+scripts/run_fast_qwen3_q_current_projection_plane_write_smoke.sh --warmup-iters 1 --timed-iters 3
+scripts/run_fast_qwen3_layer_static_kv_contract_smoke.sh --attend-seq-len 128 --tile-size 16
+scripts/run_fast_qwen3_layer_static_kv_core_dma_contract_smoke.sh --attend-seq-len 128 --tile-size 16
+scripts/run_fast_qwen3_layer_static_kv_pair_core_dma_contract_smoke.sh --attend-seq-len 128 --tile-size 16
+scripts/build_fast_qwen3_plane_attention_kernel_object.sh
+scripts/run_fast_qwen3_layer_static_kv_pair_attention_ingress_contract_smoke.sh --attend-seq-len 128 --tile-size 16
+scripts/run_fast_qwen3_layer_static_kv_dual_pair_attention_ingress_contract_smoke.sh --attend-seq-len 128 --tile-size 16
+scripts/run_fast_qwen3_layer_static_kv_dual_pair_attention_ingress_xrt_smoke.sh
+scripts/run_fast_qwen3_layer_static_kv_quad_pair_attention_ingress_contract_smoke.sh --attend-seq-len 128 --tile-size 16
+scripts/run_fast_qwen3_layer_static_kv_quad_pair_attention_ingress_xrt_smoke.sh
 scripts/run_fast_qwen3_q_current_plane_write_attention_smoke.sh --warmup-iters 1 --timed-iters 1
 scripts/run_fast_qwen3_q_current_plane_write_attention_smoke.sh --attend-seq-len 7 --write-slot 5 --attention-slot 6 --warmup-iters 1 --timed-iters 1
+scripts/run_fast_qwen3_plane_attention_o_projection_residual_smoke.sh --warmup-iters 1 --timed-iters 1
 scripts/run_fast_qwen3_attention_current_smoke.sh --num-kv-groups 8 --warmup-iters 1 --timed-iters 5
 scripts/run_fast_qwen3_qkv_attention_current_smoke.sh --warmup-iters 1 --timed-iters 5
 scripts/run_fast_qwen3_qkv_operator_smoke.sh --trace-size 131072 --timed-iters 1

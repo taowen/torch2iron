@@ -25,6 +25,7 @@ from models.fast_qwen3.q4nx_layout import (
     Q4NX_IN_CHUNK,
     Q4NX_PATCH_OUT_ROWS,
 )
+from models.fast_qwen3.kv_plane_reference import kv_plane_total_elements
 
 
 @dataclass
@@ -168,4 +169,65 @@ class Q4NXFusedQCurrentProjection(MLIROperator):
             AIERuntimeArgSpec("in", (self.in_features,), dtype=bfloat16),
             AIERuntimeArgSpec("in", (self.weight_stream_bytes,), dtype=np.uint8),
             AIERuntimeArgSpec("out", (self.q_current_elements,), dtype=bfloat16),
+        ]
+
+
+@dataclass
+class Q4NXFusedQCurrentProjectionPlaneWrite(Q4NXFusedQCurrentProjection):
+    """Fused q_current projection with persistent FastFlowLM-plane K/V write."""
+
+    packet_seq_len: int = 128
+    current_slot: int = 0
+
+    _name_aliases: ClassVar[dict[str, str]] = {
+        **Q4NXFusedQCurrentProjection._name_aliases,
+        "packet_seq_len": "psl",
+        "current_slot": "slot",
+    }
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.packet_seq_len <= 0:
+            raise ValueError("packet_seq_len must be positive")
+        if self.current_slot < 0 or self.current_slot >= self.packet_seq_len:
+            raise ValueError("current_slot must be inside packet_seq_len")
+        if self.group_index + self.num_kv_groups > 8:
+            raise ValueError("KV plane writer supports global groups in [0, 8)")
+
+    @property
+    def kv_plane_elements(self) -> int:
+        return kv_plane_total_elements(self.packet_seq_len, self.head_dim)
+
+    def get_mlir_artifact(self):
+        mlir_verbose = getattr(self.context, "mlir_verbose", False)
+        return PythonGeneratedMLIRArtifact(
+            f"{self.name}.mlir",
+            DesignGenerator(
+                self.operator_dir / "design.py",
+                "q4nx_fused_q_current_projection",
+                (
+                    aie_utils.get_current_device(),
+                    self.in_features,
+                    self.num_kv_groups,
+                    self.group_index,
+                    self.q_heads_per_group,
+                    self.head_dim,
+                ),
+                {
+                    "verbose": mlir_verbose,
+                    "kernel_object": self._kernel_object_name(),
+                    "write_kv_plane": True,
+                    "packet_seq_len": self.packet_seq_len,
+                    "current_slot": self.current_slot,
+                },
+            ),
+        )
+
+    def get_arg_spec(self):
+        return [
+            AIERuntimeArgSpec("in", (self.in_features,), dtype=bfloat16),
+            AIERuntimeArgSpec("in", (self.in_features,), dtype=bfloat16),
+            AIERuntimeArgSpec("in", (self.weight_stream_bytes,), dtype=np.uint8),
+            AIERuntimeArgSpec("out", (self.q_current_elements,), dtype=bfloat16),
+            AIERuntimeArgSpec("inout", (self.kv_plane_elements,), dtype=bfloat16),
         ]

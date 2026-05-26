@@ -6,25 +6,17 @@ from ml_dtypes import bfloat16
 
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import Tile
 from aie.iron.placers import SequentialPlacer
+from aie.iron.device import Tile
 
-
-PATCH_ROWS = 64
-PATCH_CHUNKS = 2
-CHUNK_ROWS = PATCH_ROWS // PATCH_CHUNKS
-
-
-def _projection_tile(patch_idx, chunk_idx):
-    return Tile(2 + patch_idx // 2, 2 + (patch_idx % 2) * PATCH_CHUNKS + chunk_idx)
-
-
-def _projection_shim_tile(patch_idx):
-    return Tile(2 + patch_idx // 2, 0)
-
-
-def _projection_mem_tile(patch_idx):
-    return Tile(2 + patch_idx // 2, 1)
+from models.fast_qwen3.phase_tiles import (
+    CHUNK_ROWS,
+    PATCH_CHUNKS,
+    PATCH_ROWS,
+    projection_mem_tile,
+    projection_shim_tile,
+    projection_tile,
+)
 
 
 def q4nx_fused_linear_projection(
@@ -84,7 +76,7 @@ def q4nx_fused_linear_projection(
                 for chunk_idx in range(PATCH_CHUNKS)
             ],
             depths=[1] * PATCH_CHUNKS,
-            placement=_projection_mem_tile(patch_idx),
+            placement=projection_mem_tile(patch_idx),
         )
         for patch_idx in range(output_patches)
     ]
@@ -107,7 +99,7 @@ def q4nx_fused_linear_projection(
                 for chunk_idx in range(PATCH_CHUNKS)
             ],
             depths=[1] * PATCH_CHUNKS,
-            placement=_projection_mem_tile(patch_idx),
+            placement=projection_mem_tile(patch_idx),
         )
         for patch_idx in range(output_patches)
     ]
@@ -140,7 +132,7 @@ def q4nx_fused_linear_projection(
                 out_fifos[patch_idx][chunk_idx].prod(),
                 projection_kernel,
             ],
-            placement=_projection_tile(patch_idx, chunk_idx),
+            placement=projection_tile(patch_idx, chunk_idx),
             trace=(
                 1
                 if trace_size > 0 and patch_idx == 0 and chunk_idx == 0
@@ -193,7 +185,7 @@ def q4nx_fused_linear_projection(
                 weight_patch_fifos[patch_idx].prod(),
                 weight_l3,
                 weight_taps[patch_idx],
-                placement=_projection_shim_tile(patch_idx),
+                placement=projection_shim_tile(patch_idx),
                 task_group=tg,
             )
         for patch_idx in range(output_patches):
@@ -201,7 +193,7 @@ def q4nx_fused_linear_projection(
                 out_patch_fifos[patch_idx].cons(),
                 output_l3,
                 out_taps[patch_idx],
-                placement=_projection_shim_tile(patch_idx),
+                placement=projection_shim_tile(patch_idx),
                 wait=True,
                 task_group=tg,
             )

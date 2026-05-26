@@ -12,9 +12,8 @@ PLANES = [
 
 
 def writebd(name: str, base_bytes: int, bd_id: int, length_dwords: int, token_index: int) -> str:
-    base_dwords = base_bytes // 4
-    return f"""      // {name}: base_bytes=0x{base_bytes:06x}, base_dwords=0x{base_dwords:06x}
-      aiex.npu.writebd {{bd_id = {bd_id} : i32, buffer_length = {length_dwords} : i32, buffer_offset = {base_dwords} : i32, burst_length = 64 : i32, column = 0 : i32, d0_size = 0 : i32, d0_stride = 0 : i32, d0_zero_after = 0 : i32, d0_zero_before = 0 : i32, d1_size = 0 : i32, d1_stride = 0 : i32, d1_zero_after = 0 : i32, d1_zero_before = 0 : i32, d2_size = 0 : i32, d2_stride = 0 : i32, d2_zero_after = 0 : i32, d2_zero_before = 0 : i32, enable_packet = 1 : i32, iteration_current = 0 : i32, iteration_size = 0 : i32, iteration_stride = 0 : i32, lock_acq_enable = 0 : i32, lock_acq_id = 0 : i32, lock_acq_val = 0 : i32, lock_rel_id = 0 : i32, lock_rel_val = 0 : i32, next_bd = 0 : i32, out_of_order_id = {token_index} : i32, packet_id = {token_index} : i32, packet_type = 0 : i32, row = 0 : i32, use_next_bd = 0 : i32, valid_bd = 1 : i32}}"""
+    return f"""      // {name}: base_bytes=0x{base_bytes:06x}, length_dwords={length_dwords}
+      aiex.npu.writebd {{bd_id = {bd_id} : i32, buffer_length = {length_dwords} : i32, buffer_offset = {base_bytes} : i32, burst_length = 64 : i32, column = 0 : i32, d0_size = 0 : i32, d0_stride = 0 : i32, d0_zero_after = 0 : i32, d0_zero_before = 0 : i32, d1_size = 0 : i32, d1_stride = 0 : i32, d1_zero_after = 0 : i32, d1_zero_before = 0 : i32, d2_size = 0 : i32, d2_stride = 0 : i32, d2_zero_after = 0 : i32, d2_zero_before = 0 : i32, enable_packet = 1 : i32, iteration_current = 0 : i32, iteration_size = 0 : i32, iteration_stride = 0 : i32, lock_acq_enable = 0 : i32, lock_acq_id = 0 : i32, lock_acq_val = 0 : i32, lock_rel_id = 0 : i32, lock_rel_val = 0 : i32, next_bd = 0 : i32, out_of_order_id = {token_index} : i32, packet_id = {token_index} : i32, packet_type = 0 : i32, row = 0 : i32, use_next_bd = 0 : i32, valid_bd = 1 : i32}}"""
 
 
 def build_mlir(length_dwords: int) -> str:
